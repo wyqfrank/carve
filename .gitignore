@@ -1,0 +1,17 @@
+# Build output
+/target/
+*.exe
+*.pdb
+
+# Cargo.lock for binaries (remove this line if building a library)
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
