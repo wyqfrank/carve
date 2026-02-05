@@ -1,18 +1,33 @@
-# carve
-Carve is a two-stage digital camera photo recovery system that combines deterministic binary-level file carving with AI-based perceptual restoration, explicitly separating provable data recovery from plausible reconstruction.
+# Carve
 
-Carve targets real-world camera failure modes such as:
+> A two-stage digital camera photo recovery system that combines deterministic binary-level file carving with AI-based perceptual restoration.
 
-interrupted writes
+---
 
-corrupted file allocation tables
+## Overview
 
-partially overwritten sectors
+Carve explicitly separates **provable data recovery** from **plausible reconstruction**, ensuring transparency about what is truly recovered versus what is intelligently restored.
 
-truncated image files
+## Target Recovery Scenarios
 
-The system does not claim to recover original ground-truth data when it no longer exists. Instead, it:
+Carve addresses real-world camera failure modes:
 
-deterministically extracts all recoverable image data at the binary level
+- **Interrupted writes** — incomplete file saves due to power loss or card removal
+- **Corrupted file allocation tables** — damaged filesystem metadata
+- **Partially overwritten sectors** — storage reused before full erasure
+- **Truncated image files** — incomplete data due to storage limits or errors
 
-optionally applies AI-based restoration to improve visual quality where corruption is irrecoverable
+## Philosophy
+
+The system does not claim to recover original ground-truth data when it no longer exists.
+
+Instead, Carve:
+
+1. **Deterministically extracts** all recoverable image data at the binary level
+2. **Optionally applies AI-based restoration** to improve visual quality where corruption is irrecoverable
+
+---
+
+## License
+
+See [LICENSE](LICENSE) for details.
