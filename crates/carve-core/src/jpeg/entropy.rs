@@ -1,0 +1,1 @@
+// Entropy stream scanning
