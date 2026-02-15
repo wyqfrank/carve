@@ -1,5 +1,5 @@
 // JPEG marker constants and helpers
-pub const SOI: u8 = 0xDB; // Start of image
+pub const SOI: u8 = 0xD8; // Start of image
 pub const EOI: u8 = 0xD9; // End of image
 pub const SOS: u8 = 0xDA; // Start of scan
 

@@ -1,6 +1,5 @@
 // Pre-SOS segment parsing
 use super::markers;
-use super::util::be_u16;
 
 #[inline]
 pub fn be_u16(bytes: &[u8], i: usize) -> Option<u16> {
@@ -214,4 +213,301 @@ pub fn parse_until_sos(bytes: &[u8], start: usize, max_size_bytes: usize) -> Res
     }
 
     Err(ParseError::MissingSos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::markers;
+
+    // helpers
+
+    /// Build a minimal length-bearing segment: FF <marker> <len_hi> <len_lo> <payload...>
+    fn make_segment(marker: u8, payload: &[u8]) -> Vec<u8> {
+        let len = (payload.len() + 2) as u16;
+        let mut v = vec![0xFF, marker, (len >> 8) as u8, len as u8];
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Build a minimal valid JPEG header: SOI + DQT + SOS (with tiny payloads)
+    fn make_minimal_jpeg() -> Vec<u8> {
+        let mut buf = vec![0xFF, markers::SOI];          // SOI
+        buf.extend(make_segment(markers::DQT, &[0; 4])); // DQT with 4-byte payload
+        buf.extend(make_segment(markers::SOS, &[0; 4])); // SOS with 4-byte payload
+        buf
+    }
+
+    // be_u16
+
+    #[test]
+    fn be_u16_valid() {
+        assert_eq!(be_u16(&[0x00, 0x02], 0), Some(2));
+        assert_eq!(be_u16(&[0x01, 0x00], 0), Some(256));
+        assert_eq!(be_u16(&[0xFF, 0xFF], 0), Some(0xFFFF));
+    }
+
+    #[test]
+    fn be_u16_out_of_bounds() {
+        assert_eq!(be_u16(&[0x01], 0), None);
+        assert_eq!(be_u16(&[], 0), None);
+        assert_eq!(be_u16(&[0x00, 0x01], 1), None);
+    }
+
+    // read_marker
+
+    #[test]
+    fn read_marker_basic() {
+        let data = [0xFF, 0xE0]; // APP0
+        let (marker, mpos, next) = read_marker(&data, 0, data.len()).unwrap();
+        assert_eq!(marker, 0xE0);
+        assert_eq!(mpos, 0);
+        assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn read_marker_skips_fill_bytes() {
+        let data = [0xFF, 0xFF, 0xFF, 0xE0]; // three FF fill, then APP0
+        let (marker, mpos, next) = read_marker(&data, 0, data.len()).unwrap();
+        assert_eq!(marker, 0xE0);
+        assert_eq!(mpos, 0);
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn read_marker_empty_input() {
+        assert!(read_marker(&[], 0, 0).is_err());
+    }
+
+    #[test]
+    fn read_marker_only_ff() {
+        let data = [0xFF];
+        assert!(read_marker(&data, 0, data.len()).is_err());
+    }
+
+    // parse_segment
+
+    #[test]
+    fn parse_segment_valid_app0() {
+        // FF E0 00 05 XX XX XX  (len=5 → 3 bytes payload)
+        let data = [0xFF, 0xE0, 0x00, 0x05, 0xAA, 0xBB, 0xCC];
+        let seg = parse_segment(&data, 0xE0, 0, 2, data.len()).unwrap();
+        assert_eq!(seg.marker, 0xE0);
+        assert_eq!(seg.marker_pos, 0);
+        assert_eq!(seg.payload_pos, 4);
+        assert_eq!(seg.payload_len, 3);
+        assert_eq!(seg.seg_end, 7);
+    }
+
+    #[test]
+    fn parse_segment_length_too_small() {
+        // len = 1, which is < 2 (invalid)
+        let data = [0xFF, 0xE0, 0x00, 0x01];
+        let err = parse_segment(&data, 0xE0, 0, 2, data.len()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidSegmentLength { at: 0, len: 1 }));
+    }
+
+    #[test]
+    fn parse_segment_length_zero() {
+        let data = [0xFF, 0xE0, 0x00, 0x00];
+        let err = parse_segment(&data, 0xE0, 0, 2, data.len()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidSegmentLength { at: 0, len: 0 }));
+    }
+
+    #[test]
+    fn parse_segment_length_overflows_file() {
+        // len = 0x00FF = 255, but file is only 6 bytes
+        let data = [0xFF, 0xE0, 0x00, 0xFF, 0x00, 0x00];
+        let err = parse_segment(&data, 0xE0, 0, 2, data.len()).unwrap_err();
+        assert!(matches!(err, ParseError::SegmentLengthOverflows { .. }));
+    }
+
+    #[test]
+    fn parse_segment_minimum_valid_length() {
+        // len = 2 → 0 bytes payload, still valid
+        let data = [0xFF, 0xE0, 0x00, 0x02];
+        let seg = parse_segment(&data, 0xE0, 0, 2, data.len()).unwrap();
+        assert_eq!(seg.payload_len, 0);
+        assert_eq!(seg.seg_end, 4);
+    }
+
+    #[test]
+    fn parse_segment_rejects_no_length_marker() {
+        // SOI has no length field
+        let data = [0xFF, markers::SOI, 0x00, 0x02];
+        let err = parse_segment(&data, markers::SOI, 0, 2, data.len()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidMarkerStream { .. }));
+    }
+
+    #[test]
+    fn parse_segment_unknown_marker_with_valid_length() {
+        // 0xFE = COM, a less common but valid length-bearing marker
+        let data = [0xFF, 0xFE, 0x00, 0x04, 0x41, 0x42];
+        let seg = parse_segment(&data, 0xFE, 0, 2, data.len()).unwrap();
+        assert_eq!(seg.marker, 0xFE);
+        assert_eq!(seg.payload_len, 2);
+    }
+
+    // parse_until_sos 
+
+    #[test]
+    fn parse_until_sos_minimal() {
+        let jpeg = make_minimal_jpeg();
+        let result = parse_until_sos(&jpeg, 0, jpeg.len()).unwrap();
+        assert!(result.has_dqt);
+        assert!(!result.has_exif);
+        assert!(!result.has_dht);
+        assert_eq!(result.segments_parsed, 2); // DQT + SOS
+    }
+
+    #[test]
+    fn parse_until_sos_not_jpeg() {
+        let data = [0x00, 0x00, 0x00, 0x00];
+        let err = parse_until_sos(&data, 0, data.len()).unwrap_err();
+        assert!(matches!(err, ParseError::NotJpeg));
+    }
+
+    #[test]
+    fn parse_until_sos_empty() {
+        assert!(parse_until_sos(&[], 0, 0).is_err());
+    }
+
+    #[test]
+    fn parse_until_sos_missing_sos() {
+        // SOI + DQT but no SOS
+        let mut buf = vec![0xFF, markers::SOI];
+        buf.extend(make_segment(markers::DQT, &[0; 4]));
+        let err = parse_until_sos(&buf, 0, buf.len()).unwrap_err();
+        assert!(matches!(err, ParseError::MissingSos));
+    }
+
+    #[test]
+    fn parse_until_sos_rejects_restart_in_header() {
+        // SOI + RST0 is invalid before SOS
+        let buf = vec![0xFF, markers::SOI, 0xFF, 0xD0];
+        let err = parse_until_sos(&buf, 0, buf.len()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidMarkerStream { .. }));
+    }
+
+    #[test]
+    fn parse_until_sos_rejects_eoi_before_sos() {
+        let buf = vec![0xFF, markers::SOI, 0xFF, markers::EOI];
+        let err = parse_until_sos(&buf, 0, buf.len()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidMarkerStream { .. }));
+    }
+
+    #[test]
+    fn parse_until_sos_rejects_nested_soi() {
+        // SOI then another SOI is suspicious
+        let buf = vec![0xFF, markers::SOI, 0xFF, markers::SOI];
+        let err = parse_until_sos(&buf, 0, buf.len()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidMarkerStream { .. }));
+    }
+
+    #[test]
+    fn parse_until_sos_with_sof0_extracts_dimensions() {
+        let mut buf = vec![0xFF, markers::SOI];
+
+        // SOF0 payload: precision(1) + height(2) + width(2) + components(1) = 6 bytes min
+        // height=480 (0x01E0), width=640 (0x0280)
+        let sof_payload = [0x08, 0x01, 0xE0, 0x02, 0x80, 0x03];
+        buf.extend(make_segment(markers::SOF0, &sof_payload));
+        buf.extend(make_segment(markers::SOS, &[0; 4]));
+
+        let result = parse_until_sos(&buf, 0, buf.len()).unwrap();
+        assert_eq!(result.width, Some(640));
+        assert_eq!(result.height, Some(480));
+        assert_eq!(result.is_progressive, Some(false));
+    }
+
+    #[test]
+    fn parse_until_sos_sof2_detected_as_progressive() {
+        let mut buf = vec![0xFF, markers::SOI];
+        let sof_payload = [0x08, 0x00, 0x64, 0x00, 0xC8, 0x03]; // 100x200
+        buf.extend(make_segment(markers::SOF2, &sof_payload));
+        buf.extend(make_segment(markers::SOS, &[0; 4]));
+
+        let result = parse_until_sos(&buf, 0, buf.len()).unwrap();
+        assert_eq!(result.is_progressive, Some(true));
+        assert_eq!(result.width, Some(200));
+        assert_eq!(result.height, Some(100));
+    }
+
+    #[test]
+    fn parse_until_sos_detects_exif() {
+        let mut buf = vec![0xFF, markers::SOI];
+
+        // APP1 with Exif header
+        let mut exif_payload = b"Exif\0\0".to_vec();
+        exif_payload.extend_from_slice(&[0; 10]); // dummy TIFF data
+        buf.extend(make_segment(0xE1, &exif_payload));
+        buf.extend(make_segment(markers::SOS, &[0; 4]));
+
+        let result = parse_until_sos(&buf, 0, buf.len()).unwrap();
+        assert!(result.has_exif);
+    }
+
+    #[test]
+    fn parse_until_sos_detects_dht() {
+        let mut buf = vec![0xFF, markers::SOI];
+        buf.extend(make_segment(markers::DHT, &[0; 4]));
+        buf.extend(make_segment(markers::SOS, &[0; 4]));
+
+        let result = parse_until_sos(&buf, 0, buf.len()).unwrap();
+        assert!(result.has_dht);
+    }
+
+    #[test]
+    fn parse_until_sos_nonzero_start_offset() {
+        // Garbage bytes before the JPEG
+        let mut buf = vec![0x00, 0x00, 0x00];
+        let start = buf.len();
+        buf.push(0xFF);
+        buf.push(markers::SOI);
+        buf.extend(make_segment(markers::SOS, &[0; 4]));
+
+        let result = parse_until_sos(&buf, start, buf.len()).unwrap();
+        assert_eq!(result.segments_parsed, 1); // just SOS
+    }
+
+    #[test]
+    fn parse_until_sos_max_size_limits_scan() {
+        let mut buf = vec![0xFF, markers::SOI];
+        buf.extend(make_segment(markers::DQT, &[0; 4]));
+        buf.extend(make_segment(markers::SOS, &[0; 4]));
+
+        // Set max_size so small it cuts off before SOS
+        let err = parse_until_sos(&buf, 0, 6).unwrap_err();
+        assert!(matches!(err, ParseError::MissingSos | ParseError::OutOfBounds | ParseError::SegmentLengthOverflows { .. }));
+    }
+
+    #[test]
+    fn parse_until_sos_random_noise() {
+        let noise: Vec<u8> = (0..256).map(|i| (i * 37 % 256) as u8).collect();
+        assert!(parse_until_sos(&noise, 0, noise.len()).is_err());
+    }
+
+    #[test]
+    fn parse_until_sos_sof_zero_dimensions_rejected() {
+        let mut buf = vec![0xFF, markers::SOI];
+        // SOF0 with width=0
+        let sof_payload = [0x08, 0x01, 0xE0, 0x00, 0x00, 0x03];
+        buf.extend(make_segment(markers::SOF0, &sof_payload));
+        buf.extend(make_segment(markers::SOS, &[0; 4]));
+
+        let err = parse_until_sos(&buf, 0, buf.len()).unwrap_err();
+        assert!(matches!(err, ParseError::BadSofPayload { .. }));
+    }
+
+    #[test]
+    fn parse_until_sos_sof_payload_too_short() {
+        let mut buf = vec![0xFF, markers::SOI];
+        // SOF0 with only 3 bytes of payload (needs 6)
+        let sof_payload = [0x08, 0x01, 0xE0];
+        buf.extend(make_segment(markers::SOF0, &sof_payload));
+        buf.extend(make_segment(markers::SOS, &[0; 4]));
+
+        let err = parse_until_sos(&buf, 0, buf.len()).unwrap_err();
+        assert!(matches!(err, ParseError::BadSofPayload { .. }));
+    }
 }
