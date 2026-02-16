@@ -8,6 +8,7 @@ pub fn be_u16(bytes: &[u8], i: usize) -> Option<u16> {
     Some((hi << 8) | lo)
 }
 
+#[derive(Debug)]
 pub struct ParsedSegment {
     pub marker: u8,
     pub marker_pos: usize,   // points at the 0xFF byte
