@@ -28,27 +28,27 @@ fn main() {
 
     match parse_until_sos(&bytes, 0, max_scan) {
         Ok(result) => {
-            println!("  SOS marker at:    byte {}", result.sos_marker_pos);
-            println!("  Scan starts at:   byte {}", result.scan_start);
-            println!("  Segments parsed:  {}", result.segments_parsed);
+            println!("SOS marker at: byte {}", result.sos_marker_pos);
+            println!("Scan starts at: byte {}", result.scan_start);
+            println!("Segments parsed: {}", result.segments_parsed);
 
             match (result.width, result.height) {
-                (Some(w), Some(h)) => println!("  Dimensions:       {} x {}", w, h),
-                _ => println!("  Dimensions:       (not found)"),
+                (Some(w), Some(h)) => println!("Dimensions: {} x {}", w, h),
+                _ => println!("Dimensions: (not found)"),
             }
 
             match result.is_progressive {
-                Some(true)  => println!("  Progressive:      yes"),
-                Some(false) => println!("  Progressive:      no"),
-                None        => println!("  Progressive:      (unknown)"),
+                Some(true)  => println!("Progressive: yes"),
+                Some(false) => println!("Progressive: no"),
+                None        => println!("Progressive: (unknown)"),
             }
 
-            println!("  Has DQT:          {}", if result.has_dqt { "yes" } else { "no" });
-            println!("  Has DHT:          {}", if result.has_dht { "yes" } else { "no" });
-            println!("  Has Exif:         {}", if result.has_exif { "yes" } else { "no" });
+            println!("Has DQT: {}", if result.has_dqt { "yes" } else { "no" });
+            println!("Has DHT: {}", if result.has_dht { "yes" } else { "no" });
+            println!("Has Exif: {}", if result.has_exif { "yes" } else { "no" });
 
             println!();
-            println!("  ✓ Parse successful");
+            println!("Parse successful");
         }
         Err(e) => {
             let msg = match &e {
@@ -64,7 +64,7 @@ fn main() {
                 ParseError::BadSofPayload { at } =>
                     format!("bad SOF payload at byte {}", at),
             };
-            eprintln!("  ✗ Parse failed: {}", msg);
+            eprintln!("Parse failed: {}", msg);
             process::exit(1);
         }
     }
