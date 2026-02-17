@@ -103,22 +103,7 @@ pub fn parse_segment(bytes: &[u8], marker: u8, marker_pos: usize, pos_after_mark
     })
 }
 
-fn parse_sof(bytes: &[u8], seg: &ParsedSegment) -> Result<(u16, u16), ParseError> {
-    // Need at least 6 bytes: P(1) + Y(2) + X(2) + Nf(1)
-    if seg.payload_len < 6 {
-        return Err(ParseError::BadSofPayload { at: seg.marker_pos });
-    }
-    let p = seg.payload_pos;
 
-    let height = be_u16(bytes, p + 1).ok_or(ParseError::OutOfBounds)?;
-    let width  = be_u16(bytes, p + 3).ok_or(ParseError::OutOfBounds)?;
-
-    // Basic sanity (don’t be too strict)
-    if width == 0 || height == 0 {
-        return Err(ParseError::BadSofPayload { at: seg.marker_pos });
-    }
-    Ok((width, height))
-}
 
 fn seg_has_exif(bytes: &[u8], seg: &ParsedSegment) -> bool {
     // APP1 payload often starts with "Exif\0\0"
@@ -203,10 +188,20 @@ pub fn parse_until_sos(bytes: &[u8], start: usize, max_size_bytes: usize) -> Res
         if seg.marker == markers::DHT { has_dht = true; }
 
         if seg.marker == markers::SOF0 || seg.marker == markers::SOF2 {
-            let (w, h) = parse_sof(bytes, &seg)?;
-            width = Some(w);
-            height = Some(h);
-            is_progressive = Some(seg.marker == markers::SOF2);
+            // Refactored to use meta::parse_sof_metadata
+            let payload = &bytes[seg.payload_pos..(seg.payload_pos + seg.payload_len)];
+            let is_prog = seg.marker == markers::SOF2;
+            
+            match crate::jpeg::meta::parse_sof_metadata(payload, is_prog) {
+                Ok(m) => {
+                    width = Some(m.width as u16);
+                    height = Some(m.height as u16);
+                    is_progressive = Some(m.is_progressive);
+                }
+                Err(_) => {
+                    return Err(ParseError::BadSofPayload { at: seg.marker_pos });
+                }
+            }
         }
 
         // Move to next segment
