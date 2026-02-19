@@ -8,6 +8,7 @@ pub fn be_u16(bytes: &[u8], i: usize) -> Option<u16> {
     Some((hi << 8) | lo)
 }
 
+#[derive(Debug)]
 pub struct ParsedSegment {
     pub marker: u8,
     pub marker_pos: usize,   // points at the 0xFF byte
@@ -102,22 +103,7 @@ pub fn parse_segment(bytes: &[u8], marker: u8, marker_pos: usize, pos_after_mark
     })
 }
 
-fn parse_sof(bytes: &[u8], seg: &ParsedSegment) -> Result<(u16, u16), ParseError> {
-    // Need at least 6 bytes: P(1) + Y(2) + X(2) + Nf(1)
-    if seg.payload_len < 6 {
-        return Err(ParseError::BadSofPayload { at: seg.marker_pos });
-    }
-    let p = seg.payload_pos;
 
-    let height = be_u16(bytes, p + 1).ok_or(ParseError::OutOfBounds)?;
-    let width  = be_u16(bytes, p + 3).ok_or(ParseError::OutOfBounds)?;
-
-    // Basic sanity (don’t be too strict)
-    if width == 0 || height == 0 {
-        return Err(ParseError::BadSofPayload { at: seg.marker_pos });
-    }
-    Ok((width, height))
-}
 
 fn seg_has_exif(bytes: &[u8], seg: &ParsedSegment) -> bool {
     // APP1 payload often starts with "Exif\0\0"
@@ -202,10 +188,20 @@ pub fn parse_until_sos(bytes: &[u8], start: usize, max_size_bytes: usize) -> Res
         if seg.marker == markers::DHT { has_dht = true; }
 
         if seg.marker == markers::SOF0 || seg.marker == markers::SOF2 {
-            let (w, h) = parse_sof(bytes, &seg)?;
-            width = Some(w);
-            height = Some(h);
-            is_progressive = Some(seg.marker == markers::SOF2);
+            // Refactored to use meta::parse_sof_metadata
+            let payload = &bytes[seg.payload_pos..(seg.payload_pos + seg.payload_len)];
+            let is_prog = seg.marker == markers::SOF2;
+            
+            match crate::jpeg::meta::parse_sof_metadata(payload, is_prog) {
+                Ok(m) => {
+                    width = Some(m.width as u16);
+                    height = Some(m.height as u16);
+                    is_progressive = Some(m.is_progressive);
+                }
+                Err(_) => {
+                    return Err(ParseError::BadSofPayload { at: seg.marker_pos });
+                }
+            }
         }
 
         // Move to next segment
@@ -509,5 +505,91 @@ mod tests {
 
         let err = parse_until_sos(&buf, 0, buf.len()).unwrap_err();
         assert!(matches!(err, ParseError::BadSofPayload { .. }));
+    }
+
+    #[test]
+    fn parse_until_sos_stops_at_exact_byte() {
+        // make_segment(_, &[0;4]) produces 8 bytes: FF marker 00 06 XX XX XX XX
+        // make_minimal_jpeg() layout:
+        //   SOI:  [0..2)   = 2 bytes
+        //   DQT:  [2..10)  = 8 bytes  (FF DB 00 06 + 4 payload)
+        //   SOS:  [10..18) = 8 bytes  (FF DA 00 06 + 4 payload)
+        let jpeg = make_minimal_jpeg();
+        assert_eq!(jpeg.len(), 18);
+
+        let result = parse_until_sos(&jpeg, 0, jpeg.len()).unwrap();
+        assert_eq!(result.sos_marker_pos, 10); // SOS marker starts at byte 10
+        assert_eq!(result.scan_start, 18);     // entropy data starts right after SOS
+    }
+
+    #[test]
+    fn parse_until_sos_realistic_camera_jpeg() {
+        // Simulate a realistic camera JPEG header:
+        // SOI → APP0 (JFIF) → DQT → SOF0 → DHT → APP1 (Exif) → SOS
+        let mut buf = vec![0xFF, markers::SOI];
+
+        // APP0 with JFIF identifier
+        let mut jfif_payload = b"JFIF\0".to_vec();
+        jfif_payload.extend_from_slice(&[1, 1, 0, 0, 72, 0, 72, 0, 0]); // v1.1, 72 DPI
+        buf.extend(make_segment(0xE0, &jfif_payload));
+
+        // DQT — 64-byte quantization table (id=0)
+        let mut dqt_payload = vec![0x00]; // table ID 0, 8-bit precision
+        dqt_payload.extend_from_slice(&[16; 64]); // 64 quantization values
+        buf.extend(make_segment(markers::DQT, &dqt_payload));
+
+        // SOF0 — baseline, 1920×1080, 3 components
+        // precision(1) + height(2) + width(2) + num_components(1) + 3×(id+sampling+qtable)
+        let sof_payload = [
+            0x08,       // 8-bit precision
+            0x04, 0x38, // height = 1080
+            0x07, 0x80, // width  = 1920
+            0x03,       // 3 components (Y, Cb, Cr)
+            0x01, 0x22, 0x00, // Y:  id=1, sampling=2×2, quant table 0
+            0x02, 0x11, 0x01, // Cb: id=2, sampling=1×1, quant table 1
+            0x03, 0x11, 0x01, // Cr: id=3, sampling=1×1, quant table 1
+        ];
+        buf.extend(make_segment(markers::SOF0, &sof_payload));
+
+        // DHT — Huffman table (minimal)
+        let dht_payload = vec![0x00; 20]; // dummy Huffman data
+        buf.extend(make_segment(markers::DHT, &dht_payload));
+
+        // APP1 with Exif header
+        let mut exif_payload = b"Exif\0\0".to_vec();
+        exif_payload.extend_from_slice(&[0x4D, 0x4D, 0x00, 0x2A]); // big-endian TIFF
+        exif_payload.extend_from_slice(&[0; 16]); // dummy IFD data
+        buf.extend(make_segment(0xE1, &exif_payload));
+
+        // SOS — start of scan
+        let sos_payload = [
+            0x03,                   // 3 components
+            0x01, 0x00,             // Y:  dc=0, ac=0
+            0x02, 0x11,             // Cb: dc=1, ac=1
+            0x03, 0x11,             // Cr: dc=1, ac=1
+            0x00, 0x3F, 0x00,       // spectral selection
+        ];
+        buf.extend(make_segment(markers::SOS, &sos_payload));
+
+        let sos_expected_pos = buf.len() - (2 + 2 + sos_payload.len()); // FF DA + len bytes + payload
+
+        let result = parse_until_sos(&buf, 0, buf.len()).unwrap();
+
+        // All metadata flags set
+        assert!(result.has_dqt,  "should detect DQT");
+        assert!(result.has_dht,  "should detect DHT");
+        assert!(result.has_exif, "should detect Exif APP1");
+
+        // SOF0 dimensions
+        assert_eq!(result.width,  Some(1920));
+        assert_eq!(result.height, Some(1080));
+        assert_eq!(result.is_progressive, Some(false));
+
+        // Segment count: APP0 + DQT + SOF0 + DHT + APP1 + SOS = 6
+        assert_eq!(result.segments_parsed, 6);
+
+        // Exact stop position
+        assert_eq!(result.sos_marker_pos, sos_expected_pos);
+        assert_eq!(result.scan_start, buf.len());
     }
 }
