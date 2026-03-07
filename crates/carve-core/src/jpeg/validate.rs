@@ -7,6 +7,13 @@ use super::parse::PreSosResult;
 pub struct ValidationOptions {
     pub allow_truncated: bool,
     pub max_size: usize,
+    pub patch_eoi: PatchEoiPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchEoiPolicy {
+    None,
+    Append,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +35,8 @@ pub struct ValidatedCandidate {
 /// Truncated policy (ticket 4.1):
 /// - If EOI is not found, emit `Truncated` only when `allow_truncated=true`.
 /// - Truncated ranges end at entropy boundary or max_size, whichever comes first.
-/// - `patched_eoi` is always false for now (ticket 4.2 may change this).
+/// EOI patching policy (ticket 4.2):
+/// - If candidate is truncated and `patch_eoi == Append`, set `patched_eoi=true`.
 pub fn validate_candidate(
     start: usize,
     pre_sos: &PreSosResult,
@@ -57,15 +65,19 @@ pub fn validate_candidate(
         return None;
     }
 
+    let status = if is_recovered {
+        RecoveryStatus::Recovered
+    } else {
+        RecoveryStatus::Truncated
+    };
+    let patched_eoi = matches!(status, RecoveryStatus::Truncated)
+        && matches!(options.patch_eoi, PatchEoiPolicy::Append);
+
     Some(ValidatedCandidate {
         start,
         end,
-        status: if is_recovered {
-            RecoveryStatus::Recovered
-        } else {
-            RecoveryStatus::Truncated
-        },
-        patched_eoi: false,
+        status,
+        patched_eoi,
         has_exif: pre_sos.has_exif,
         has_dqt: pre_sos.has_dqt,
         has_dht: pre_sos.has_dht,
@@ -110,6 +122,7 @@ mod tests {
             ValidationOptions {
                 allow_truncated: false,
                 max_size: 10_000,
+                patch_eoi: PatchEoiPolicy::Append,
             },
         )
         .unwrap();
@@ -132,6 +145,7 @@ mod tests {
             ValidationOptions {
                 allow_truncated: false,
                 max_size: 10_000,
+                patch_eoi: PatchEoiPolicy::Append,
             },
         );
         assert!(out.is_none());
@@ -146,6 +160,7 @@ mod tests {
             ValidationOptions {
                 allow_truncated: true,
                 max_size: 10_000,
+                patch_eoi: PatchEoiPolicy::None,
             },
         )
         .unwrap();
@@ -168,11 +183,49 @@ mod tests {
             ValidationOptions {
                 allow_truncated: true,
                 max_size: 50,
+                patch_eoi: PatchEoiPolicy::Append,
             },
         )
         .unwrap();
 
         assert_eq!(candidate.end, 150);
         assert_eq!(candidate.status, RecoveryStatus::Truncated);
+        assert!(candidate.patched_eoi);
+    }
+
+    #[test]
+    fn truncated_candidate_sets_patched_eoi_when_append_mode() {
+        let candidate = validate_candidate(
+            100,
+            &pre_sos(120),
+            &entropy(EntropyTerminationReason::OutOfBounds, 280),
+            ValidationOptions {
+                allow_truncated: true,
+                max_size: 10_000,
+                patch_eoi: PatchEoiPolicy::Append,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(candidate.status, RecoveryStatus::Truncated);
+        assert!(candidate.patched_eoi);
+    }
+
+    #[test]
+    fn recovered_candidate_never_sets_patched_eoi() {
+        let candidate = validate_candidate(
+            100,
+            &pre_sos(150),
+            &entropy(EntropyTerminationReason::Eoi, 200),
+            ValidationOptions {
+                allow_truncated: false,
+                max_size: 10_000,
+                patch_eoi: PatchEoiPolicy::Append,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(candidate.status, RecoveryStatus::Recovered);
+        assert!(!candidate.patched_eoi);
     }
 }
