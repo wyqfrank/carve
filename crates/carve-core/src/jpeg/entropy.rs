@@ -195,6 +195,15 @@ mod tests {
     }
 
     #[test]
+    fn false_eoi_pattern_inside_stuffed_data_is_ignored() {
+        // The 0xD9 byte after FF 00 is payload, not a marker.
+        let data = [0x11, 0xFF, 0x00, 0xD9, 0x22, 0xFF, 0xD9];
+        let r = scan_entropy_stream(&data, 0, data.len());
+        assert_eq!(r.reason, eoi_at(5).reason);
+        assert_eq!(r.end_offset, 5);
+    }
+
+    #[test]
     fn multiple_stuffed_bytes() {
         let data = [0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0xD9];
         let r = scan_entropy_stream(&data, 0, data.len());
