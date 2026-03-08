@@ -29,8 +29,9 @@ pub fn apply_overlap_policy(candidates: Vec<Candidate>, options: OverlapOptions)
 ///
 /// Rules:
 /// - Sort by start ascending, then end ascending.
-/// - Emit only ranges that do not overlap the last emitted range.
-/// - For equal-start overlaps, prefer complete over truncated.
+/// - Group connected overlaps into clusters.
+/// - For each cluster, emit the strongest candidate using deterministic ranking:
+///   complete > truncated, larger span preferred, then earlier start.
 pub fn suppress_overlapping_candidates(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
     candidates.sort_by(|a, b| {
         a.start
@@ -40,22 +41,33 @@ pub fn suppress_overlapping_candidates(mut candidates: Vec<Candidate>) -> Vec<Ca
     });
 
     let mut emitted: Vec<Candidate> = Vec::with_capacity(candidates.len());
+    let mut cluster_best: Option<Candidate> = None;
+    let mut cluster_end: usize = 0;
 
     for candidate in candidates {
-        match emitted.last_mut() {
-            None => emitted.push(candidate),
-            Some(last) => {
-                if candidate.start >= last.end {
-                    emitted.push(candidate);
+        match cluster_best {
+            None => {
+                cluster_end = candidate.end;
+                cluster_best = Some(candidate);
+            }
+            Some(best) => {
+                if candidate.start >= cluster_end {
+                    emitted.push(best);
+                    cluster_end = candidate.end;
+                    cluster_best = Some(candidate);
                     continue;
                 }
 
-                // Edge case: overlapping complete candidate should replace truncated.
-                if is_complete(candidate) && !is_complete(*last) {
-                    *last = candidate;
+                cluster_end = cluster_end.max(candidate.end);
+                if candidate_is_stronger(candidate, best) {
+                    cluster_best = Some(candidate);
                 }
             }
         }
+    }
+
+    if let Some(best) = cluster_best {
+        emitted.push(best);
     }
 
     emitted
@@ -72,6 +84,33 @@ fn status_rank(status: RecoveryStatus) -> u8 {
 #[inline]
 fn is_complete(candidate: Candidate) -> bool {
     matches!(candidate.status, RecoveryStatus::Recovered)
+}
+
+#[inline]
+fn span(candidate: Candidate) -> usize {
+    candidate.end.saturating_sub(candidate.start)
+}
+
+fn candidate_is_stronger(lhs: Candidate, rhs: Candidate) -> bool {
+    if is_complete(lhs) != is_complete(rhs) {
+        return is_complete(lhs);
+    }
+
+    let lhs_span = span(lhs);
+    let rhs_span = span(rhs);
+    if lhs_span != rhs_span {
+        return lhs_span > rhs_span;
+    }
+
+    if lhs.start != rhs.start {
+        return lhs.start < rhs.start;
+    }
+
+    if lhs.end != rhs.end {
+        return lhs.end < rhs.end;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -168,6 +207,38 @@ mod tests {
         ];
         let out = suppress_overlapping_candidates(input);
         assert_eq!(out, vec![c(10, 100, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn nested_candidates_prefer_larger_span() {
+        let input = vec![
+            c(10, 120, RecoveryStatus::Recovered),
+            c(20, 80, RecoveryStatus::Recovered),
+            c(30, 70, RecoveryStatus::Recovered),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(out, vec![c(10, 120, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn connected_overlap_cluster_selects_single_strongest_candidate() {
+        let input = vec![
+            c(0, 10, RecoveryStatus::Recovered),
+            c(5, 20, RecoveryStatus::Recovered),
+            c(15, 40, RecoveryStatus::Recovered),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(out, vec![c(15, 40, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn same_status_and_span_prefers_earlier_start() {
+        let input = vec![
+            c(10, 30, RecoveryStatus::Recovered),
+            c(12, 32, RecoveryStatus::Recovered),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(out, vec![c(10, 30, RecoveryStatus::Recovered)]);
     }
 
     #[test]
