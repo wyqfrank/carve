@@ -1,5 +1,30 @@
 use crate::jpeg::candidate::{Candidate, RecoveryStatus};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlapOptions {
+    pub keep_overlaps: bool,
+}
+
+impl Default for OverlapOptions {
+    fn default() -> Self {
+        Self {
+            keep_overlaps: false,
+        }
+    }
+}
+
+/// Apply overlap policy to validated candidates.
+///
+/// Default behavior suppresses overlaps. Setting `keep_overlaps=true`
+/// returns candidates unchanged.
+pub fn apply_overlap_policy(candidates: Vec<Candidate>, options: OverlapOptions) -> Vec<Candidate> {
+    if options.keep_overlaps {
+        candidates
+    } else {
+        suppress_overlapping_candidates(candidates)
+    }
+}
+
 /// Suppress overlapping candidate ranges deterministically.
 ///
 /// Rules:
@@ -163,5 +188,30 @@ mod tests {
                 c(100, 120, RecoveryStatus::Recovered)
             ]
         );
+    }
+
+    #[test]
+    fn default_mode_suppresses_overlaps() {
+        let input = vec![
+            c(0, 50, RecoveryStatus::Recovered),
+            c(40, 90, RecoveryStatus::Recovered),
+        ];
+        let out = apply_overlap_policy(input, OverlapOptions::default());
+        assert_eq!(out, vec![c(0, 50, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn keep_overlaps_mode_emits_all_candidates() {
+        let input = vec![
+            c(0, 50, RecoveryStatus::Recovered),
+            c(40, 90, RecoveryStatus::Recovered),
+        ];
+        let out = apply_overlap_policy(
+            input.clone(),
+            OverlapOptions {
+                keep_overlaps: true,
+            },
+        );
+        assert_eq!(out, input);
     }
 }

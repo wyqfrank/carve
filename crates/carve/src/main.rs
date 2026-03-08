@@ -4,14 +4,55 @@ use std::process;
 
 use carve_core::jpeg::parse::{parse_until_sos, ParseError};
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliOptions {
+    file_path: String,
+    keep_overlaps: bool,
+}
+
+fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     if args.len() < 2 {
-        eprintln!("Usage: carve <file.jpg>");
-        process::exit(1);
+        return Err("Usage: carve [--keep-overlaps] <file.jpg>".to_string());
     }
 
-    let path = &args[1];
+    let mut keep_overlaps = false;
+    let mut file_path: Option<String> = None;
+
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--keep-overlaps" => keep_overlaps = true,
+            _ if arg.starts_with('-') => {
+                return Err(format!("Unknown flag: {arg}\nUsage: carve [--keep-overlaps] <file.jpg>"));
+            }
+            _ => {
+                if file_path.is_some() {
+                    return Err("Only one input file is supported.\nUsage: carve [--keep-overlaps] <file.jpg>".to_string());
+                }
+                file_path = Some(arg.clone());
+            }
+        }
+    }
+
+    match file_path {
+        Some(path) => Ok(CliOptions {
+            file_path: path,
+            keep_overlaps,
+        }),
+        None => Err("Missing input file.\nUsage: carve [--keep-overlaps] <file.jpg>".to_string()),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let options = match parse_args(&args) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{msg}");
+            process::exit(1);
+        }
+    };
+
+    let path = &options.file_path;
     let bytes = match fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -21,6 +62,10 @@ fn main() {
     };
 
     println!("Parsing: {} ({:.1} KB)", path, bytes.len() as f64 / 1024.0);
+    println!(
+        "Keep overlaps: {}",
+        if options.keep_overlaps { "enabled" } else { "disabled" }
+    );
     println!();
 
     // Allow up to 64 MB for the pre-SOS header scan
@@ -67,5 +112,34 @@ fn main() {
             eprintln!("Parse failed: {}", msg);
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_without_flag() {
+        let parsed = parse_args(&args(&["carve", "image.jpg"])).unwrap();
+        assert_eq!(parsed.file_path, "image.jpg");
+        assert!(!parsed.keep_overlaps);
+    }
+
+    #[test]
+    fn parses_keep_overlaps_flag() {
+        let parsed = parse_args(&args(&["carve", "--keep-overlaps", "image.jpg"])).unwrap();
+        assert_eq!(parsed.file_path, "image.jpg");
+        assert!(parsed.keep_overlaps);
+    }
+
+    #[test]
+    fn rejects_unknown_flag() {
+        let err = parse_args(&args(&["carve", "--bad-flag", "image.jpg"])).unwrap_err();
+        assert!(err.contains("Unknown flag"));
     }
 }
