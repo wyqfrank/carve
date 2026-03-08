@@ -16,12 +16,13 @@ pub enum PatchEoiPolicy {
     Append,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ValidatedCandidate {
     pub start: usize,
     pub end: usize, // exclusive
     pub status: RecoveryStatus,
     pub patched_eoi: bool,
+    pub confidence_score: f32,
     pub has_exif: bool,
     pub has_dqt: bool,
     pub has_dht: bool,
@@ -70,6 +71,7 @@ pub fn validate_candidate(
     } else {
         RecoveryStatus::Truncated
     };
+    let confidence_score = compute_confidence_score(pre_sos, status);
     let patched_eoi = matches!(status, RecoveryStatus::Truncated)
         && matches!(options.patch_eoi, PatchEoiPolicy::Append);
 
@@ -78,6 +80,7 @@ pub fn validate_candidate(
         end,
         status,
         patched_eoi,
+        confidence_score,
         has_exif: pre_sos.has_exif,
         has_dqt: pre_sos.has_dqt,
         has_dht: pre_sos.has_dht,
@@ -85,6 +88,32 @@ pub fn validate_candidate(
         height: pre_sos.height,
         is_progressive: pre_sos.is_progressive,
     })
+}
+
+fn compute_confidence_score(pre_sos: &PreSosResult, status: RecoveryStatus) -> f32 {
+    let mut points: i32 = 0;
+
+    // `validate_candidate` is called only after pre-SOS validation, so SOI/SOS are valid.
+    points += 20; // valid SOI
+    points += 20; // has SOS
+
+    if pre_sos.has_exif {
+        points += 20;
+    }
+
+    let has_sof = pre_sos.width.is_some() && pre_sos.height.is_some();
+    if has_sof {
+        points += 30;
+    }
+
+    if matches!(status, RecoveryStatus::Recovered) {
+        points += 10; // normal EOI
+    } else {
+        points -= 15; // truncated
+    }
+
+    points = points.clamp(0, 100);
+    points as f32 / 100.0
 }
 
 #[cfg(test)]
@@ -131,6 +160,7 @@ mod tests {
         assert_eq!(candidate.end, 202); // include FF D9
         assert_eq!(candidate.status, RecoveryStatus::Recovered);
         assert!(!candidate.patched_eoi);
+        assert!((candidate.confidence_score - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -169,6 +199,7 @@ mod tests {
         assert_eq!(candidate.end, 280);
         assert_eq!(candidate.status, RecoveryStatus::Truncated);
         assert!(!candidate.patched_eoi);
+        assert!((candidate.confidence_score - 0.75).abs() < f32::EPSILON);
         assert!(candidate.has_exif);
         assert_eq!(candidate.width, Some(640));
         assert_eq!(candidate.height, Some(480));
@@ -227,5 +258,21 @@ mod tests {
 
         assert_eq!(candidate.status, RecoveryStatus::Recovered);
         assert!(!candidate.patched_eoi);
+    }
+
+    #[test]
+    fn confidence_model_applies_weights_and_clamps() {
+        let mut with_no_signals = pre_sos(120);
+        with_no_signals.has_exif = false;
+        with_no_signals.width = None;
+        with_no_signals.height = None;
+
+        // SOI + SOS + truncated penalty = 0.25
+        let low = compute_confidence_score(&with_no_signals, RecoveryStatus::Truncated);
+        assert!((low - 0.25).abs() < f32::EPSILON);
+
+        // SOI + SOS + EXIF + SOF + EOI = 1.0
+        let high = compute_confidence_score(&pre_sos(120), RecoveryStatus::Recovered);
+        assert!((high - 1.0).abs() < f32::EPSILON);
     }
 }
