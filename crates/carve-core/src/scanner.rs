@@ -29,6 +29,50 @@ pub fn recover_candidates(bytes: &[u8], options: ValidationOptions) -> Vec<Valid
         .collect()
 }
 
+/// Apply overlap suppression to a list of `ValidatedCandidate` results.
+///
+/// When `keep_overlaps=false` (default), overlapping candidates are suppressed:
+/// candidates are sorted by start asc then end desc (longer span first), and
+/// a greedy scan emits a candidate only when its start >= the previous emitted end.
+/// This ensures recovered (longer) candidates beat truncated (shorter) ones at the
+/// same start position, and nested/partially-overlapping candidates are dropped.
+pub fn apply_validated_overlap_policy(
+    mut candidates: Vec<ValidatedCandidate>,
+    options: OverlapOptions,
+) -> Vec<ValidatedCandidate> {
+    if options.keep_overlaps {
+        return candidates;
+    }
+
+    // Sort: start asc, then end desc (longer span first), then recovered before truncated.
+    candidates.sort_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then_with(|| b.end.cmp(&a.end))
+            .then_with(|| validated_status_rank(a.status).cmp(&validated_status_rank(b.status)))
+    });
+
+    let mut out: Vec<ValidatedCandidate> = Vec::new();
+    let mut last_end: usize = 0;
+
+    for c in candidates {
+        if c.start >= last_end {
+            last_end = c.end;
+            out.push(c);
+        }
+    }
+
+    out
+}
+
+#[inline]
+fn validated_status_rank(status: RecoveryStatus) -> u8 {
+    match status {
+        RecoveryStatus::Recovered => 0,
+        RecoveryStatus::Truncated => 1,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlapOptions {
     pub keep_overlaps: bool,
@@ -428,5 +472,101 @@ mod tests {
         let result = recover_candidates(&data, default_options(data.len()));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].start, 16);
+    }
+
+    // --- apply_validated_overlap_policy tests ---
+
+    fn make_validated(start: usize, end: usize, status: RecoveryStatus) -> ValidatedCandidate {
+        let confidence = if status == RecoveryStatus::Recovered { 0.8 } else { 0.5 };
+        ValidatedCandidate {
+            start, end, status,
+            patched_eoi: false,
+            confidence_score: confidence,
+            has_exif: false,
+            has_dqt: true,
+            has_dht: false,
+            width: Some(320),
+            height: Some(240),
+            is_progressive: Some(false),
+        }
+    }
+
+    fn v(start: usize, end: usize, status: RecoveryStatus) -> ValidatedCandidate {
+        make_validated(start, end, status)
+    }
+
+    #[test]
+    fn validated_suppression_keeps_non_overlapping() {
+        let input = vec![
+            v(0, 50, RecoveryStatus::Recovered),
+            v(50, 100, RecoveryStatus::Recovered),
+            v(120, 150, RecoveryStatus::Truncated),
+        ];
+        let out = apply_validated_overlap_policy(input, OverlapOptions::default());
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].start, 0);
+        assert_eq!(out[1].start, 50);
+        assert_eq!(out[2].start, 120);
+    }
+
+    #[test]
+    fn validated_suppression_drops_nested_candidate() {
+        let input = vec![
+            v(0, 100, RecoveryStatus::Recovered),
+            v(20, 80, RecoveryStatus::Recovered), // nested
+        ];
+        let out = apply_validated_overlap_policy(input, OverlapOptions::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].start, 0);
+        assert_eq!(out[0].end, 100);
+    }
+
+    #[test]
+    fn validated_suppression_drops_partial_overlap() {
+        let input = vec![
+            v(0, 60, RecoveryStatus::Recovered),
+            v(40, 100, RecoveryStatus::Recovered), // overlaps
+        ];
+        let out = apply_validated_overlap_policy(input, OverlapOptions::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].start, 0);
+    }
+
+    #[test]
+    fn validated_suppression_recovered_beats_truncated_same_start() {
+        let input = vec![
+            v(0, 30, RecoveryStatus::Truncated),
+            v(0, 100, RecoveryStatus::Recovered),
+        ];
+        let out = apply_validated_overlap_policy(input, OverlapOptions::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, RecoveryStatus::Recovered);
+        assert_eq!(out[0].end, 100);
+    }
+
+    #[test]
+    fn validated_suppression_duplicate_ranges_emit_one() {
+        let input = vec![
+            v(10, 50, RecoveryStatus::Recovered),
+            v(10, 50, RecoveryStatus::Recovered),
+        ];
+        let out = apply_validated_overlap_policy(input, OverlapOptions::default());
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn validated_keep_overlaps_emits_all() {
+        let input = vec![
+            v(0, 100, RecoveryStatus::Recovered),
+            v(20, 80, RecoveryStatus::Recovered),
+        ];
+        let out = apply_validated_overlap_policy(input.clone(), OverlapOptions { keep_overlaps: true });
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn validated_suppression_empty_input() {
+        let out = apply_validated_overlap_policy(vec![], OverlapOptions::default());
+        assert!(out.is_empty());
     }
 }
