@@ -7,7 +7,7 @@ use carve_core::jpeg::candidate::RecoveryStatus;
 use carve_core::jpeg::entropy::scan_entropy_stream;
 use carve_core::jpeg::markers;
 use carve_core::jpeg::parse::parse_until_sos;
-use carve_core::jpeg::validate::{validate_candidate, PatchEoiPolicy, ValidationOptions};
+use carve_core::jpeg::validate::{validate_from_parts, PatchEoiPolicy, ValidationOptions};
 
 // ---------------------------------------------------------------------------
 // Fixture builders
@@ -130,7 +130,7 @@ fn valid_jpeg_fixture_recovers_complete_candidate() {
 
     let entropy = scan_entropy_stream(&data, pre_sos.scan_start, data.len());
 
-    let candidate = validate_candidate(
+    let candidate = validate_from_parts(
         start,
         &pre_sos,
         &entropy,
@@ -163,7 +163,7 @@ fn valid_jpeg_fixture_confidence_score() {
     let pre_sos = parse_until_sos(&data, 0, data.len()).unwrap();
     let entropy = scan_entropy_stream(&data, pre_sos.scan_start, data.len());
 
-    let candidate = validate_candidate(
+    let candidate = validate_from_parts(
         0,
         &pre_sos,
         &entropy,
@@ -203,7 +203,7 @@ fn truncated_jpeg_fixture_emits_truncated_candidate() {
 
     // Strict mode: no candidate emitted for truncated file
     assert!(
-        validate_candidate(
+        validate_from_parts(
             start,
             &pre_sos,
             &entropy,
@@ -218,7 +218,7 @@ fn truncated_jpeg_fixture_emits_truncated_candidate() {
     );
 
     // Lenient mode: Truncated candidate emitted
-    let candidate = validate_candidate(
+    let candidate = validate_from_parts(
         start,
         &pre_sos,
         &entropy,
@@ -252,7 +252,7 @@ fn truncated_jpeg_fixture_eoi_patch_flag() {
     let pre_sos = parse_until_sos(&data, 0, data.len()).unwrap();
     let entropy = scan_entropy_stream(&data, pre_sos.scan_start, data.len());
 
-    let candidate = validate_candidate(
+    let candidate = validate_from_parts(
         0,
         &pre_sos,
         &entropy,

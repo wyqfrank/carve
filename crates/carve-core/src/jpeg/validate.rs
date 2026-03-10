@@ -1,7 +1,7 @@
 // JPEG validation, truncation policy, and confidence scoring
 use super::candidate::RecoveryStatus;
-use super::entropy::{EntropyResult, EntropyTerminationReason};
-use super::parse::PreSosResult;
+use super::entropy::{scan_entropy_stream, EntropyResult, EntropyTerminationReason};
+use super::parse::{parse_until_sos, PreSosResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidationOptions {
@@ -31,14 +31,29 @@ pub struct ValidatedCandidate {
     pub is_progressive: Option<bool>,
 }
 
-/// Validate a carved JPEG candidate after pre-SOS parse + entropy scan.
+/// End-to-end validation pipeline: parse → entropy scan → validated candidate.
+///
+/// Calls `parse_until_sos`, `scan_entropy_stream`, and `validate_from_parts` in sequence.
+/// Returns `None` when the bytes at `start` cannot produce a valid candidate.
+pub fn validate_candidate(
+    bytes: &[u8],
+    start: usize,
+    options: ValidationOptions,
+) -> Option<ValidatedCandidate> {
+    let max_end = bytes.len().min(start.saturating_add(options.max_size));
+    let pre_sos = parse_until_sos(bytes, start, options.max_size).ok()?;
+    let entropy = scan_entropy_stream(bytes, pre_sos.scan_start, max_end);
+    validate_from_parts(start, &pre_sos, &entropy, options)
+}
+
+/// Validate a carved JPEG candidate from pre-computed parse + entropy results.
 ///
 /// Truncated policy (ticket 4.1):
 /// - If EOI is not found, emit `Truncated` only when `allow_truncated=true`.
 /// - Truncated ranges end at entropy boundary or max_size, whichever comes first.
 /// EOI patching policy (ticket 4.2):
 /// - If candidate is truncated and `patch_eoi == Append`, set `patched_eoi=true`.
-pub fn validate_candidate(
+pub fn validate_from_parts(
     start: usize,
     pre_sos: &PreSosResult,
     entropy: &EntropyResult,
@@ -144,7 +159,7 @@ mod tests {
 
     #[test]
     fn recovered_candidate_is_emitted_even_if_truncated_not_allowed() {
-        let candidate = validate_candidate(
+        let candidate = validate_from_parts(
             100,
             &pre_sos(150),
             &entropy(EntropyTerminationReason::Eoi, 200),
@@ -165,7 +180,7 @@ mod tests {
 
     #[test]
     fn truncated_candidate_requires_allow_truncated() {
-        let out = validate_candidate(
+        let out = validate_from_parts(
             100,
             &pre_sos(120),
             &entropy(
@@ -183,7 +198,7 @@ mod tests {
 
     #[test]
     fn truncated_candidate_emits_when_allowed() {
-        let candidate = validate_candidate(
+        let candidate = validate_from_parts(
             100,
             &pre_sos(120),
             &entropy(EntropyTerminationReason::OutOfBounds, 280),
@@ -207,7 +222,7 @@ mod tests {
 
     #[test]
     fn truncated_candidate_is_bounded_by_max_size() {
-        let candidate = validate_candidate(
+        let candidate = validate_from_parts(
             100,
             &pre_sos(120),
             &entropy(EntropyTerminationReason::OutOfBounds, 500),
@@ -226,7 +241,7 @@ mod tests {
 
     #[test]
     fn truncated_candidate_sets_patched_eoi_when_append_mode() {
-        let candidate = validate_candidate(
+        let candidate = validate_from_parts(
             100,
             &pre_sos(120),
             &entropy(EntropyTerminationReason::OutOfBounds, 280),
@@ -244,7 +259,7 @@ mod tests {
 
     #[test]
     fn recovered_candidate_never_sets_patched_eoi() {
-        let candidate = validate_candidate(
+        let candidate = validate_from_parts(
             100,
             &pre_sos(150),
             &entropy(EntropyTerminationReason::Eoi, 200),
@@ -274,5 +289,143 @@ mod tests {
         // SOI + SOS + EXIF + SOF + EOI = 1.0
         let high = compute_confidence_score(&pre_sos(120), RecoveryStatus::Recovered);
         assert!((high - 1.0).abs() < f32::EPSILON);
+    }
+
+    // --- End-to-end tests for validate_candidate (orchestrating function) ---
+
+    fn make_segment_bytes(marker: u8, payload: &[u8]) -> Vec<u8> {
+        let len = (payload.len() + 2) as u16;
+        let mut v = vec![0xFF, marker, (len >> 8) as u8, len as u8];
+        v.extend_from_slice(payload);
+        v
+    }
+
+    fn make_valid_jpeg_bytes() -> Vec<u8> {
+        use super::super::markers;
+        let mut buf = vec![0xFF, markers::SOI];
+        // DQT
+        let mut dqt = vec![0x00u8];
+        dqt.extend_from_slice(&[16u8; 64]);
+        buf.extend(make_segment_bytes(markers::DQT, &dqt));
+        // SOF0: height=240, width=320, 3 components
+        let sof = [0x08, 0x00, 0xF0, 0x01, 0x40, 0x03,
+                   0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01];
+        buf.extend(make_segment_bytes(markers::SOF0, &sof));
+        // SOS
+        let sos = [0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00];
+        buf.extend(make_segment_bytes(markers::SOS, &sos));
+        // entropy + EOI
+        buf.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+        buf.extend_from_slice(&[0xFF, 0xD9]);
+        buf
+    }
+
+    fn make_truncated_jpeg_bytes() -> Vec<u8> {
+        use super::super::markers;
+        let mut buf = vec![0xFF, markers::SOI];
+        let mut dqt = vec![0x00u8];
+        dqt.extend_from_slice(&[16u8; 64]);
+        buf.extend(make_segment_bytes(markers::DQT, &dqt));
+        let sof = [0x08, 0x00, 0x78, 0x00, 0xA0, 0x03,
+                   0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01];
+        buf.extend(make_segment_bytes(markers::SOF0, &sof));
+        let sos = [0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00];
+        buf.extend(make_segment_bytes(markers::SOS, &sos));
+        // entropy only, no EOI
+        buf.extend_from_slice(&[0xAB, 0xCD, 0xEF, 0x12, 0x34]);
+        buf
+    }
+
+    #[test]
+    fn end_to_end_valid_jpeg_returns_recovered() {
+        let data = make_valid_jpeg_bytes();
+        let candidate = validate_candidate(
+            &data,
+            0,
+            ValidationOptions {
+                allow_truncated: false,
+                max_size: data.len(),
+                patch_eoi: PatchEoiPolicy::None,
+            },
+        )
+        .expect("valid JPEG should produce a candidate");
+
+        assert_eq!(candidate.status, RecoveryStatus::Recovered);
+        assert_eq!(candidate.start, 0);
+        assert_eq!(candidate.end, data.len());
+        assert!(!candidate.patched_eoi);
+        assert_eq!(candidate.width, Some(320));
+        assert_eq!(candidate.height, Some(240));
+    }
+
+    #[test]
+    fn end_to_end_truncated_jpeg_strict_mode_returns_none() {
+        let data = make_truncated_jpeg_bytes();
+        let result = validate_candidate(
+            &data,
+            0,
+            ValidationOptions {
+                allow_truncated: false,
+                max_size: data.len(),
+                patch_eoi: PatchEoiPolicy::None,
+            },
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn end_to_end_truncated_jpeg_lenient_mode_returns_truncated() {
+        let data = make_truncated_jpeg_bytes();
+        let candidate = validate_candidate(
+            &data,
+            0,
+            ValidationOptions {
+                allow_truncated: true,
+                max_size: data.len(),
+                patch_eoi: PatchEoiPolicy::Append,
+            },
+        )
+        .expect("lenient mode should emit truncated candidate");
+
+        assert_eq!(candidate.status, RecoveryStatus::Truncated);
+        assert!(candidate.patched_eoi);
+        assert_eq!(candidate.start, 0);
+        assert_eq!(candidate.end, data.len());
+    }
+
+    #[test]
+    fn end_to_end_invalid_bytes_returns_none() {
+        let data = vec![0x00u8; 64];
+        let result = validate_candidate(
+            &data,
+            0,
+            ValidationOptions {
+                allow_truncated: true,
+                max_size: data.len(),
+                patch_eoi: PatchEoiPolicy::None,
+            },
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn end_to_end_nonzero_start_offset() {
+        let mut data = vec![0xDEu8; 32]; // garbage prefix
+        data.extend(make_valid_jpeg_bytes());
+        let start = 32;
+        let candidate = validate_candidate(
+            &data,
+            start,
+            ValidationOptions {
+                allow_truncated: false,
+                max_size: data.len(),
+                patch_eoi: PatchEoiPolicy::None,
+            },
+        )
+        .expect("should recover JPEG at nonzero offset");
+
+        assert_eq!(candidate.start, start);
+        assert_eq!(candidate.end, data.len());
+        assert_eq!(candidate.status, RecoveryStatus::Recovered);
     }
 }
