@@ -1,4 +1,33 @@
 use crate::jpeg::candidate::{Candidate, RecoveryStatus};
+use crate::jpeg::markers;
+use crate::jpeg::validate::{validate_candidate, ValidatedCandidate, ValidationOptions};
+
+/// Scan `bytes` for all SOI markers (FF D8) and return their offsets in order.
+fn find_soi_offsets(bytes: &[u8]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let len = bytes.len().saturating_sub(1);
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == 0xFF && bytes[i + 1] == markers::SOI {
+            offsets.push(i);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    offsets
+}
+
+/// Attempt validation at every SOI offset and collect successful candidates.
+///
+/// Each SOI is passed to `validate_candidate`; failures are silently skipped.
+/// Results are returned in offset order (deterministic).
+pub fn recover_candidates(bytes: &[u8], options: ValidationOptions) -> Vec<ValidatedCandidate> {
+    find_soi_offsets(bytes)
+        .into_iter()
+        .filter_map(|start| validate_candidate(bytes, start, options))
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlapOptions {
@@ -284,5 +313,120 @@ mod tests {
             },
         );
         assert_eq!(out, input);
+    }
+
+    // --- find_soi_offsets tests ---
+
+    #[test]
+    fn find_soi_offsets_empty() {
+        assert!(find_soi_offsets(&[]).is_empty());
+    }
+
+    #[test]
+    fn find_soi_offsets_single() {
+        let data = [0xFF, markers::SOI, 0x00, 0x00];
+        assert_eq!(find_soi_offsets(&data), vec![0]);
+    }
+
+    #[test]
+    fn find_soi_offsets_multiple() {
+        let mut data = vec![0x00u8; 10];
+        data[2] = 0xFF; data[3] = markers::SOI;
+        data[7] = 0xFF; data[8] = markers::SOI;
+        assert_eq!(find_soi_offsets(&data), vec![2, 7]);
+    }
+
+    #[test]
+    fn find_soi_offsets_no_soi_in_noise() {
+        let data = vec![0xAB, 0xCD, 0xEF, 0xFF, 0x00, 0xFF, 0xD7];
+        assert!(find_soi_offsets(&data).is_empty());
+    }
+
+    #[test]
+    fn find_soi_at_last_byte_not_counted() {
+        // FF at the very last byte has no following byte — must not panic or count it
+        let data = [0x00, 0xFF];
+        assert!(find_soi_offsets(&data).is_empty());
+    }
+
+    // --- recover_candidates tests ---
+
+    fn make_segment_bytes(marker: u8, payload: &[u8]) -> Vec<u8> {
+        let len = (payload.len() + 2) as u16;
+        let mut v = vec![0xFF, marker, (len >> 8) as u8, len as u8];
+        v.extend_from_slice(payload);
+        v
+    }
+
+    fn make_valid_jpeg() -> Vec<u8> {
+        let mut buf = vec![0xFF, markers::SOI];
+        let mut dqt = vec![0x00u8]; dqt.extend_from_slice(&[16u8; 64]);
+        buf.extend(make_segment_bytes(markers::DQT, &dqt));
+        let sof = [0x08, 0x00, 0xF0, 0x01, 0x40, 0x03,
+                   0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01];
+        buf.extend(make_segment_bytes(markers::SOF0, &sof));
+        let sos = [0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00];
+        buf.extend(make_segment_bytes(markers::SOS, &sos));
+        buf.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+        buf.extend_from_slice(&[0xFF, 0xD9]);
+        buf
+    }
+
+    fn default_options(data_len: usize) -> ValidationOptions {
+        use crate::jpeg::validate::PatchEoiPolicy;
+        ValidationOptions { allow_truncated: false, max_size: data_len, patch_eoi: PatchEoiPolicy::None }
+    }
+
+    #[test]
+    fn recover_candidates_empty_bytes_returns_empty() {
+        let result = recover_candidates(&[], default_options(0));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn recover_candidates_noise_returns_empty() {
+        let data = vec![0xABu8; 256];
+        let result = recover_candidates(&data, default_options(data.len()));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn recover_candidates_single_valid_jpeg() {
+        let data = make_valid_jpeg();
+        let result = recover_candidates(&data, default_options(data.len()));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].start, 0);
+        assert_eq!(result[0].end, data.len());
+        assert_eq!(result[0].status, RecoveryStatus::Recovered);
+    }
+
+    #[test]
+    fn recover_candidates_invalid_soi_is_skipped() {
+        // SOI followed by garbage — parse fails, no candidate
+        let mut data = vec![0xFF, markers::SOI];
+        data.extend_from_slice(&[0x00u8; 32]);
+        let result = recover_candidates(&data, default_options(data.len()));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn recover_candidates_two_jpegs_concatenated() {
+        let jpeg = make_valid_jpeg();
+        let mut data = jpeg.clone();
+        data.extend_from_slice(&jpeg);
+        let result = recover_candidates(&data, default_options(data.len()));
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].start, 0);
+        assert_eq!(result[1].start, jpeg.len());
+    }
+
+    #[test]
+    fn recover_candidates_results_in_offset_order() {
+        let jpeg = make_valid_jpeg();
+        let mut data = vec![0xFFu8; 16]; // garbage prefix
+        data.extend_from_slice(&jpeg);
+        let result = recover_candidates(&data, default_options(data.len()));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].start, 16);
     }
 }
