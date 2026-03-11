@@ -2,6 +2,9 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 use carve_core::jpeg::parse::parse_until_sos;
+use carve_core::jpeg::validate::{PatchEoiPolicy, ValidationOptions};
+use carve_core::scanner::{apply_validated_overlap_policy, recover_candidates, OverlapOptions};
+use carve_core::report::write_report;
 
 #[test]
 fn test_real_jpeg_parsing_valid_img_1390() {
@@ -107,4 +110,96 @@ fn test_real_jpeg_parsing_missing_soi() {
     // Should fail because SOI is missing
     let res = parse_until_sos(&buffer, 0, buffer.len());
     assert!(res.is_err(), "Should detect missing SOI/Not JPEG");
+}
+
+/// Full-pipeline regression test against the real camera JPEG fixture.
+///
+/// Discovered values (IMG_1390.JPG, 1 795 948 bytes):
+///   Before suppression — 3 candidates:
+///     [0] start=950272  end=1795948  Truncated  2992×2992  patched=true
+///     [1] start=955904  end=962285   Recovered  160×120    patched=false
+///     [2] start=964096  end=1795948  Truncated  2992×2992  patched=true
+///   After suppression — 1 candidate:
+///     [0] start=950272  end=1795948  (engulfs [1] and [2])
+///
+/// Runs recover_candidates → overlap suppression → write_report and pins
+/// all values so future refactors are caught immediately.
+#[test]
+fn real_jpeg_full_pipeline_regression_img_1390() {
+    use carve_core::jpeg::candidate::RecoveryStatus;
+
+    let mut file_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    file_path.push("tests/fixtures/IMG_1390.JPG");
+
+    if !file_path.exists() {
+        eprintln!("Skipping: fixture not found at {:?}", file_path);
+        return;
+    }
+
+    let buffer = std::fs::read(&file_path).expect("failed to read IMG_1390.JPG");
+    assert_eq!(buffer.len(), 1_795_948, "fixture size must not change");
+
+    let options = ValidationOptions {
+        allow_truncated: true,
+        max_size: buffer.len(),
+        patch_eoi: PatchEoiPolicy::Append,
+    };
+
+    // --- Before suppression: 3 embedded JPEGs ---
+    let raw = recover_candidates(&buffer, options);
+    assert_eq!(raw.len(), 3, "expected exactly 3 candidates before suppression");
+
+    assert_eq!(raw[0].start, 950272);
+    assert_eq!(raw[0].end,   1_795_948);
+    assert_eq!(raw[0].status, RecoveryStatus::Truncated);
+    assert!(raw[0].patched_eoi);
+    assert_eq!(raw[0].width,  Some(2992));
+    assert_eq!(raw[0].height, Some(2992));
+    assert_eq!(raw[0].is_progressive, Some(false));
+
+    assert_eq!(raw[1].start, 955904);
+    assert_eq!(raw[1].end,   962285);
+    assert_eq!(raw[1].status, RecoveryStatus::Recovered);
+    assert!(!raw[1].patched_eoi);
+    assert_eq!(raw[1].width,  Some(160));
+    assert_eq!(raw[1].height, Some(120));
+    assert_eq!(raw[1].is_progressive, Some(false));
+    assert!(raw[1].has_dqt);
+
+    assert_eq!(raw[2].start, 964096);
+    assert_eq!(raw[2].end,   1_795_948);
+    assert_eq!(raw[2].status, RecoveryStatus::Truncated);
+    assert!(raw[2].patched_eoi);
+    assert_eq!(raw[2].width,  Some(2992));
+    assert_eq!(raw[2].height, Some(2992));
+    assert!(raw[2].has_dqt);
+    assert!(raw[2].has_dht);
+
+    // --- After suppression: largest span wins, nested candidates dropped ---
+    let suppressed = apply_validated_overlap_policy(
+        raw,
+        OverlapOptions { keep_overlaps: false },
+    );
+    assert_eq!(suppressed.len(), 1, "overlap suppression must yield exactly 1 candidate");
+    assert_eq!(suppressed[0].start, 950272);
+    assert_eq!(suppressed[0].end,   1_795_948);
+    assert_eq!(suppressed[0].status, RecoveryStatus::Truncated);
+
+    // --- keep_overlaps preserves all three ---
+    let raw2 = recover_candidates(&buffer, options);
+    let kept = apply_validated_overlap_policy(
+        raw2,
+        OverlapOptions { keep_overlaps: true },
+    );
+    assert_eq!(kept.len(), 3);
+
+    // --- JSONL report serialises without panic ---
+    let report_path = std::env::temp_dir().join("carve_regression_img1390.jsonl");
+    write_report(&report_path, &suppressed).expect("write_report must not fail");
+    let report = std::fs::read_to_string(&report_path).unwrap();
+    let lines: Vec<&str> = report.lines().collect();
+    assert_eq!(lines.len(), 1, "one line per candidate in report");
+    assert!(lines[0].starts_with('{'));
+    assert!(lines[0].contains("\"start\":950272"));
+    let _ = std::fs::remove_file(&report_path);
 }

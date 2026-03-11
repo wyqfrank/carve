@@ -1,13 +1,14 @@
 //! Integration fixture tests.
 //!
 //! Builds synthetic JPEG fixtures in-memory and exercises the full
-//! parse → entropy-scan → validate pipeline.
+//! parse → entropy-scan → validate → overlap-suppress pipeline.
 
 use carve_core::jpeg::candidate::RecoveryStatus;
 use carve_core::jpeg::entropy::scan_entropy_stream;
 use carve_core::jpeg::markers;
 use carve_core::jpeg::parse::parse_until_sos;
-use carve_core::jpeg::validate::{validate_from_parts, PatchEoiPolicy, ValidationOptions};
+use carve_core::jpeg::validate::{validate_from_parts, PatchEoiPolicy, ValidatedCandidate, ValidationOptions};
+use carve_core::scanner::{apply_validated_overlap_policy, recover_candidates, OverlapOptions};
 
 // ---------------------------------------------------------------------------
 // Fixture builders
@@ -104,6 +105,39 @@ fn fixture_noise_with_embedded_soi() -> Vec<u8> {
     let mut buf = vec![0x00u8; 100];
     buf[50] = 0xFF;
     buf[51] = markers::SOI;
+    buf
+}
+
+/// Progressive JPEG: SOI + DQT + SOF2(480×320) + SOS + entropy + EOI.
+///
+/// Uses SOF2 instead of SOF0 to mark it as progressive.
+fn fixture_progressive_jpeg() -> Vec<u8> {
+    let mut buf = vec![0xFF, markers::SOI];
+
+    // DQT
+    let mut dqt = vec![0x00u8];
+    dqt.extend_from_slice(&[16u8; 64]);
+    buf.extend(make_segment(markers::DQT, &dqt));
+
+    // SOF2 (progressive): precision=8, height=320, width=480, 3 components
+    let sof = [
+        0x08,
+        0x01, 0x40, // height 320
+        0x01, 0xE0, // width  480
+        0x03,
+        0x01, 0x22, 0x00,
+        0x02, 0x11, 0x01,
+        0x03, 0x11, 0x01,
+    ];
+    buf.extend(make_segment(markers::SOF2, &sof));
+
+    // SOS
+    let sos = [0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00];
+    buf.extend(make_segment(markers::SOS, &sos));
+
+    // Entropy + EOI
+    buf.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+    buf.extend_from_slice(&[0xFF, 0xD9]);
     buf
 }
 
@@ -290,4 +324,144 @@ fn noise_with_embedded_soi_yields_no_candidate() {
         parse_until_sos(&data, soi_offset, data.len()).is_err(),
         "garbage after embedded SOI should fail to parse"
     );
+}
+
+/// Noise fixture with embedded SOI: recover_candidates yields no candidates.
+#[test]
+fn noise_with_embedded_soi_full_pipeline_yields_no_candidates() {
+    let data = fixture_noise_with_embedded_soi();
+    let options = ValidationOptions {
+        allow_truncated: true,
+        max_size: data.len(),
+        patch_eoi: PatchEoiPolicy::None,
+    };
+    let candidates = recover_candidates(&data, options);
+    assert!(
+        candidates.is_empty(),
+        "noise data should produce no valid candidates"
+    );
+}
+
+/// Progressive JPEG: is_progressive flag set, dimensions correct.
+#[test]
+fn progressive_jpeg_fixture_metadata_parsed_correctly() {
+    let data = fixture_progressive_jpeg();
+
+    let pre_sos = parse_until_sos(&data, 0, data.len())
+        .expect("progressive JPEG: parse_until_sos should succeed");
+
+    assert_eq!(pre_sos.width, Some(480));
+    assert_eq!(pre_sos.height, Some(320));
+    assert_eq!(pre_sos.is_progressive, Some(true), "SOF2 must set is_progressive");
+    assert!(pre_sos.has_dqt);
+    assert!(!pre_sos.has_exif);
+
+    let entropy = scan_entropy_stream(&data, pre_sos.scan_start, data.len());
+    let candidate = validate_from_parts(
+        0,
+        &pre_sos,
+        &entropy,
+        ValidationOptions {
+            allow_truncated: false,
+            max_size: data.len(),
+            patch_eoi: PatchEoiPolicy::None,
+        },
+    )
+    .expect("progressive JPEG: should produce a recovered candidate");
+
+    assert_eq!(candidate.status, RecoveryStatus::Recovered);
+    assert_eq!(candidate.is_progressive, Some(true));
+    assert_eq!(candidate.width, Some(480));
+    assert_eq!(candidate.height, Some(320));
+}
+
+/// Progressive JPEG: full pipeline via recover_candidates.
+#[test]
+fn progressive_jpeg_recovered_via_full_pipeline() {
+    let data = fixture_progressive_jpeg();
+    let options = ValidationOptions {
+        allow_truncated: false,
+        max_size: data.len(),
+        patch_eoi: PatchEoiPolicy::None,
+    };
+    let candidates = recover_candidates(&data, options);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].status, RecoveryStatus::Recovered);
+    assert_eq!(candidates[0].is_progressive, Some(true));
+}
+
+/// Two concatenated valid JPEGs: recover_candidates finds both; overlap policy
+/// preserves both (adjacent ranges share a boundary but do not overlap).
+#[test]
+fn two_concatenated_jpegs_both_recovered() {
+    let jpeg = fixture_valid_jpeg();
+    let mut data = jpeg.clone();
+    data.extend_from_slice(&jpeg);
+
+    let options = ValidationOptions {
+        allow_truncated: false,
+        max_size: data.len(),
+        patch_eoi: PatchEoiPolicy::None,
+    };
+
+    let candidates = recover_candidates(&data, options);
+    assert_eq!(candidates.len(), 2, "should find exactly two candidates");
+    assert_eq!(candidates[0].start, 0);
+    assert_eq!(candidates[0].end, jpeg.len());
+    assert_eq!(candidates[1].start, jpeg.len());
+    assert_eq!(candidates[1].end, data.len());
+
+    // Overlap suppression keeps both — they are adjacent, not overlapping.
+    let suppressed =
+        apply_validated_overlap_policy(candidates, OverlapOptions { keep_overlaps: false });
+    assert_eq!(suppressed.len(), 2, "adjacent candidates must not be dropped");
+}
+
+/// Overlapping candidates suppressed: two manually constructed candidates with
+/// overlapping byte ranges; suppression emits only the stronger one.
+#[test]
+fn overlapping_candidates_suppressed_correctly() {
+    fn make_validated(
+        start: usize,
+        end: usize,
+        status: RecoveryStatus,
+        confidence: f32,
+    ) -> ValidatedCandidate {
+        ValidatedCandidate {
+            start,
+            end,
+            status,
+            patched_eoi: false,
+            confidence_score: confidence,
+            has_exif: false,
+            has_dqt: true,
+            has_dht: false,
+            width: Some(320),
+            height: Some(240),
+            is_progressive: Some(false),
+        }
+    }
+
+    // Outer (larger span, recovered) vs inner (nested, also recovered).
+    let outer = make_validated(0, 1000, RecoveryStatus::Recovered, 0.9);
+    let inner = make_validated(100, 500, RecoveryStatus::Recovered, 0.8);
+
+    let suppressed = apply_validated_overlap_policy(
+        vec![outer, inner],
+        OverlapOptions { keep_overlaps: false },
+    );
+
+    assert_eq!(suppressed.len(), 1, "nested candidate must be suppressed");
+    assert_eq!(suppressed[0].start, 0);
+    assert_eq!(suppressed[0].end, 1000);
+
+    // With keep_overlaps=true both are preserved.
+    let kept = apply_validated_overlap_policy(
+        vec![
+            make_validated(0, 1000, RecoveryStatus::Recovered, 0.9),
+            make_validated(100, 500, RecoveryStatus::Recovered, 0.8),
+        ],
+        OverlapOptions { keep_overlaps: true },
+    );
+    assert_eq!(kept.len(), 2);
 }
