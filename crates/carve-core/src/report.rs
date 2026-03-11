@@ -1,5 +1,36 @@
+use std::io::{self, Write};
+use std::path::Path;
+
 use crate::jpeg::candidate::RecoveryStatus;
 use crate::jpeg::validate::ValidatedCandidate;
+
+#[derive(Debug)]
+pub struct ReportError(io::Error);
+
+impl std::fmt::Display for ReportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "report error: {}", self.0)
+    }
+}
+
+impl From<io::Error> for ReportError {
+    fn from(e: io::Error) -> Self {
+        Self(e)
+    }
+}
+
+/// Write one JSONL line per candidate to `path`, in order.
+pub fn write_report(path: &Path, candidates: &[ValidatedCandidate]) -> Result<(), ReportError> {
+    let file = std::fs::File::create(path)?;
+    let mut writer = io::BufWriter::new(file);
+    for candidate in candidates {
+        let line = JsonlRecord::from_validated(candidate).to_json_line();
+        writer.write_all(line.as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct JsonlRecord {
@@ -151,5 +182,46 @@ mod tests {
         assert!(json.contains("\"corruption\":{"));
         assert!(json.contains("\"confidence\":0.750"));
         assert!(json.contains("\"status\":\"truncated\""));
+    }
+
+    #[test]
+    fn write_report_produces_one_line_per_candidate() {
+        let candidates = vec![sample_candidate(), sample_candidate()];
+        let dir = std::env::temp_dir();
+        let path = dir.join("carve_test_report.jsonl");
+        write_report(&path, &candidates).expect("write_report should succeed");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            assert!(line.starts_with('{'));
+            assert!(line.ends_with('}'));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_report_empty_candidates_produces_empty_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("carve_test_empty_report.jsonl");
+        write_report(&path, &[]).expect("write_report should succeed");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_report_lines_are_valid_json_objects() {
+        let candidates = vec![sample_candidate()];
+        let dir = std::env::temp_dir();
+        let path = dir.join("carve_test_json_report.jsonl");
+        write_report(&path, &candidates).expect("write_report should succeed");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let line = contents.lines().next().unwrap();
+        assert!(line.contains("\"start\":128"));
+        assert!(line.contains("\"end\":4096"));
+        assert!(line.contains("\"jpeg_meta\":"));
+        assert!(line.contains("\"corruption\":"));
+        let _ = std::fs::remove_file(&path);
     }
 }
