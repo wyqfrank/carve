@@ -15,9 +15,10 @@
 .DS_Store
 Thumbs.db
 
-# Claude
+# Tooling
 .claude/
 CLAUDE.md
+SPEC.md
 
 # fixtures (private photos)
 crates/carve-core/tests/fixtures/*
