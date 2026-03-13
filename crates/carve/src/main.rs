@@ -55,8 +55,8 @@ fn output_dir_for(input: &str) -> PathBuf {
     let stem = Path::new(input)
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or("recovered");
-    PathBuf::from(format!("{}_recovered", stem))
+        .unwrap_or("unknown");
+    PathBuf::from("recovered").join(stem)
 }
 
 fn main() {
@@ -171,8 +171,8 @@ mod tests {
 
     #[test]
     fn output_dir_derives_from_stem() {
-        assert_eq!(output_dir_for("image.jpg"), PathBuf::from("image_recovered"));
-        assert_eq!(output_dir_for("dump.bin"), PathBuf::from("dump_recovered"));
-        assert_eq!(output_dir_for("no_ext"), PathBuf::from("no_ext_recovered"));
+        assert_eq!(output_dir_for("image.jpg"), PathBuf::from("recovered").join("image"));
+        assert_eq!(output_dir_for("dump.bin"), PathBuf::from("recovered").join("dump"));
+        assert_eq!(output_dir_for("no_ext"), PathBuf::from("recovered").join("no_ext"));
     }
 }

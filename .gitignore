@@ -21,3 +21,6 @@ CLAUDE.md
 
 # fixtures (private photos)
 crates/carve-core/tests/fixtures/*
+
+# output
+recovered/
