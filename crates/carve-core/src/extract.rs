@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::jpeg::validate::ValidatedCandidate;
 
+const SOI_MARKER: [u8; 2] = [0xFF, 0xD8];
 const EOI_MARKER: [u8; 2] = [0xFF, 0xD9];
 
 #[derive(Debug)]
@@ -37,6 +38,9 @@ pub fn extract_candidates(
         let path = output_dir.join(&filename);
         let file = std::fs::File::create(&path)?;
         let mut writer = io::BufWriter::new(file);
+        if candidate.missing_soi {
+            writer.write_all(&SOI_MARKER)?;
+        }
         let slice = &bytes[candidate.start..candidate.end];
         writer.write_all(slice)?;
         if candidate.patched_eoi {
@@ -64,6 +68,7 @@ mod tests {
                 RecoveryStatus::Recovered
             },
             patched_eoi,
+            missing_soi: false,
             confidence_score: 0.9,
             has_exif: false,
             has_dqt: true,
@@ -138,6 +143,31 @@ mod tests {
         let dir = temp_subdir("empty");
         let paths = extract_candidates(&data, &[], &dir).unwrap();
         assert!(paths.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepends_soi_when_missing_soi_true() {
+        let data: Vec<u8> = (0u8..=255).collect();
+        let mut candidate = make_candidate(10, 20, false);
+        candidate.missing_soi = true;
+        let dir = temp_subdir("prepend_soi");
+        let paths = extract_candidates(&data, &[candidate], &dir).unwrap();
+        let written = std::fs::read(&paths[0]).unwrap();
+        // Should start with FF D8 (SOI), then the original bytes
+        assert_eq!(&written[..2], &[0xFF, 0xD8]);
+        assert_eq!(&written[2..], &data[10..20]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_soi_prepended_when_missing_soi_false() {
+        let data: Vec<u8> = (0u8..=255).collect();
+        let candidate = make_candidate(10, 20, false);
+        let dir = temp_subdir("no_prepend_soi");
+        let paths = extract_candidates(&data, &[candidate], &dir).unwrap();
+        let written = std::fs::read(&paths[0]).unwrap();
+        assert_eq!(written, &data[10..20]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

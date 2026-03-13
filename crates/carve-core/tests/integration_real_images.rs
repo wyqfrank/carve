@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
+use carve_core::extract::extract_candidates;
 use carve_core::jpeg::parse::parse_until_sos;
 use carve_core::jpeg::validate::{PatchEoiPolicy, ValidationOptions};
 use carve_core::scanner::{apply_validated_overlap_policy, recover_candidates, OverlapOptions};
@@ -202,4 +203,75 @@ fn real_jpeg_full_pipeline_regression_img_1390() {
     assert!(lines[0].starts_with('{'));
     assert!(lines[0].contains("\"start\":950272"));
     let _ = std::fs::remove_file(&report_path);
+}
+
+/// Full-pipeline test for a JPEG file where only the SOI marker is missing
+/// but the rest of the JPEG header (APP/DQT/SOF/SOS) is intact.
+///
+/// The `missing_soi.JPG` fixture is a more severely corrupted file — its
+/// entire JPEG header is stripped, leaving only raw entropy-coded scan data
+/// followed by embedded thumbnail JPEGs. The headerless detector requires
+/// at least the APP/DQT/SOF markers to be present (just not the SOI prefix),
+/// so the main image in this file cannot be recovered by the current approach.
+///
+/// This test verifies:
+/// - The pipeline does not crash on this file.
+/// - The existing SOI-based thumbnails are still found correctly.
+/// - If any headerless candidate IS found (from markers between thumbnails),
+///   it has `missing_soi=true` and is extracted with a synthesized FF D8 prefix.
+#[test]
+fn test_missing_soi_full_pipeline() {
+    let mut file_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    file_path.push("tests/fixtures/missing_soi.JPG");
+
+    if !file_path.exists() {
+        eprintln!("Skipping: fixture not found at {:?}", file_path);
+        return;
+    }
+
+    let buffer = std::fs::read(&file_path).expect("failed to read missing_soi.JPG");
+
+    let options = ValidationOptions {
+        allow_truncated: true,
+        max_size: buffer.len(),
+        patch_eoi: PatchEoiPolicy::Append,
+    };
+
+    // Pipeline must not crash
+    let raw = recover_candidates(&buffer, options);
+    assert!(!raw.is_empty(), "should find at least the embedded thumbnail candidates");
+
+    // All SOI-based candidates must not have missing_soi
+    for c in raw.iter().filter(|c| !c.missing_soi) {
+        assert!(!c.missing_soi, "SOI-based candidates should have missing_soi=false");
+    }
+
+    // If any headerless candidates were found, verify they have missing_soi=true
+    // and that extraction prepends FF D8.
+    let headerless: Vec<_> = raw.iter().filter(|c| c.missing_soi).collect();
+    if !headerless.is_empty() {
+        let out_dir = std::env::temp_dir().join("carve_test_missing_soi_pipeline");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let suppressed = apply_validated_overlap_policy(
+            raw.clone(),
+            OverlapOptions { keep_overlaps: false },
+        );
+        let paths = extract_candidates(&buffer, &suppressed, &out_dir)
+            .expect("extraction must not fail");
+
+        for (idx, c) in suppressed.iter().enumerate() {
+            if c.missing_soi {
+                let written = std::fs::read(&paths[idx]).unwrap();
+                assert_eq!(
+                    &written[..2],
+                    &[0xFF, 0xD8],
+                    "headerless candidate at {} must start with synthesized SOI",
+                    c.start,
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
 }

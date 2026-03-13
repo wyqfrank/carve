@@ -56,6 +56,7 @@ pub struct JpegMeta {
 pub struct CorruptionInfo {
     pub truncated: bool,
     pub eoi_patched: bool,
+    pub missing_soi: bool,
 }
 
 impl JsonlRecord {
@@ -77,6 +78,7 @@ impl JsonlRecord {
             corruption: CorruptionInfo {
                 truncated,
                 eoi_patched: candidate.patched_eoi,
+                missing_soi: candidate.missing_soi,
             },
         }
     }
@@ -103,7 +105,8 @@ impl JsonlRecord {
                 "}},",
                 "\"corruption\":{{",
                 "\"truncated\":{},",
-                "\"eoi_patched\":{}",
+                "\"eoi_patched\":{},",
+                "\"missing_soi\":{}",
                 "}}",
                 "}}"
             ),
@@ -119,6 +122,7 @@ impl JsonlRecord {
             self.jpeg_meta.has_dht,
             self.corruption.truncated,
             self.corruption.eoi_patched,
+            self.corruption.missing_soi,
         )
     }
 }
@@ -149,6 +153,7 @@ mod tests {
             end: 4096,
             status: RecoveryStatus::Truncated,
             patched_eoi: true,
+            missing_soi: false,
             confidence_score: 0.75,
             has_exif: true,
             has_dqt: true,

@@ -432,6 +432,7 @@ fn overlapping_candidates_suppressed_correctly() {
             end,
             status,
             patched_eoi: false,
+            missing_soi: false,
             confidence_score: confidence,
             has_exif: false,
             has_dqt: true,

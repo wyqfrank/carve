@@ -1,6 +1,8 @@
 use crate::jpeg::candidate::{Candidate, RecoveryStatus};
 use crate::jpeg::markers;
-use crate::jpeg::validate::{validate_candidate, ValidatedCandidate, ValidationOptions};
+use crate::jpeg::validate::{
+    validate_candidate, validate_headerless_candidate, ValidatedCandidate, ValidationOptions,
+};
 
 /// Scan `bytes` for all SOI markers (FF D8) and return their offsets in order.
 fn find_soi_offsets(bytes: &[u8]) -> Vec<usize> {
@@ -18,15 +20,66 @@ fn find_soi_offsets(bytes: &[u8]) -> Vec<usize> {
     offsets
 }
 
+/// Scan `bytes` for JPEG header-region markers (APP0–APPF, DQT, SOF0, SOF2) that
+/// are not already covered by any SOI-based candidate range.
+///
+/// Returns candidate start offsets for potential headerless JPEGs in order.
+fn find_headerless_candidates(bytes: &[u8], soi_candidates: &[ValidatedCandidate]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let len = bytes.len().saturating_sub(1);
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == 0xFF {
+            let marker = bytes[i + 1];
+            let is_header_marker = markers::is_app(marker)
+                || marker == markers::DQT
+                || marker == markers::SOF0
+                || marker == markers::SOF2;
+            if is_header_marker {
+                // Exclude positions that are immediately inside an SOI sequence
+                // (i.e. 2 bytes after an SOI marker, which means we already found
+                // this JPEG via the SOI path).
+                let after_soi = i >= 2
+                    && bytes[i - 2] == 0xFF
+                    && bytes[i - 1] == markers::SOI;
+                // Exclude positions within an existing SOI-based candidate range
+                let in_soi_range = soi_candidates
+                    .iter()
+                    .any(|c| i >= c.start && i < c.end);
+                if !after_soi && !in_soi_range {
+                    offsets.push(i);
+                }
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    offsets
+}
+
 /// Attempt validation at every SOI offset and collect successful candidates.
 ///
-/// Each SOI is passed to `validate_candidate`; failures are silently skipped.
-/// Results are returned in offset order (deterministic).
+/// Also scans for headerless JPEG candidates (APP/DQT/SOF markers without a
+/// leading SOI) and merges them with SOI-based results. Results are returned
+/// in start-offset order (deterministic).
 pub fn recover_candidates(bytes: &[u8], options: ValidationOptions) -> Vec<ValidatedCandidate> {
-    find_soi_offsets(bytes)
+    // SOI-based candidates (existing behavior)
+    let mut soi_candidates: Vec<ValidatedCandidate> = find_soi_offsets(bytes)
         .into_iter()
         .filter_map(|start| validate_candidate(bytes, start, options))
-        .collect()
+        .collect();
+
+    // Headerless candidates not already covered by SOI ranges
+    let headerless: Vec<ValidatedCandidate> =
+        find_headerless_candidates(bytes, &soi_candidates)
+            .into_iter()
+            .filter_map(|start| validate_headerless_candidate(bytes, start, options))
+            .collect();
+
+    soi_candidates.extend(headerless);
+    soi_candidates.sort_by_key(|c| c.start);
+    soi_candidates
 }
 
 /// Apply overlap suppression to a list of `ValidatedCandidate` results.
@@ -481,6 +534,7 @@ mod tests {
         ValidatedCandidate {
             start, end, status,
             patched_eoi: false,
+            missing_soi: false,
             confidence_score: confidence,
             has_exif: false,
             has_dqt: true,
@@ -568,5 +622,88 @@ mod tests {
     fn validated_suppression_empty_input() {
         let out = apply_validated_overlap_policy(vec![], OverlapOptions::default());
         assert!(out.is_empty());
+    }
+
+    // --- find_headerless_candidates tests ---
+
+    #[test]
+    fn find_headerless_app0_at_start_returned() {
+        // Data starts with FF E0 (APP0) — no preceding SOI
+        let data = [0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00];
+        let offsets = find_headerless_candidates(&data, &[]);
+        assert_eq!(offsets, vec![0]);
+    }
+
+    #[test]
+    fn find_headerless_dqt_at_start_returned() {
+        let data = [0xFF, markers::DQT, 0x00, 0x04, 0x00, 0x00];
+        let offsets = find_headerless_candidates(&data, &[]);
+        assert_eq!(offsets, vec![0]);
+    }
+
+    #[test]
+    fn find_headerless_app0_after_soi_excluded() {
+        // FF D8 FF E0 ... — APP0 immediately after SOI, should be excluded
+        let data = [0xFF, markers::SOI, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00];
+        let offsets = find_headerless_candidates(&data, &[]);
+        assert!(offsets.is_empty());
+    }
+
+    #[test]
+    fn find_headerless_marker_inside_soi_candidate_excluded() {
+        // APP0 at offset 10, but it's within an SOI candidate [0, 50)
+        let mut data = vec![0x00u8; 50];
+        data[10] = 0xFF;
+        data[11] = 0xE0;
+        let soi_cand = make_validated(0, 50, RecoveryStatus::Recovered);
+        let offsets = find_headerless_candidates(&data, &[soi_cand]);
+        assert!(offsets.is_empty());
+    }
+
+    #[test]
+    fn find_headerless_noise_returns_empty() {
+        // Random bytes without any header markers
+        let data = vec![0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let offsets = find_headerless_candidates(&data, &[]);
+        assert!(offsets.is_empty());
+    }
+
+    // --- recover_candidates with headerless input ---
+
+    fn make_valid_jpeg_no_soi() -> Vec<u8> {
+        // Valid JPEG structure without the leading FF D8
+        let mut buf = Vec::new();
+        let mut dqt = vec![0x00u8]; dqt.extend_from_slice(&[16u8; 64]);
+        buf.extend(make_segment_bytes(markers::DQT, &dqt));
+        let sof = [0x08, 0x00, 0xF0, 0x01, 0x40, 0x03,
+                   0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01];
+        buf.extend(make_segment_bytes(markers::SOF0, &sof));
+        let sos = [0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00];
+        buf.extend(make_segment_bytes(markers::SOS, &sos));
+        buf.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+        buf.extend_from_slice(&[0xFF, 0xD9]);
+        buf
+    }
+
+    #[test]
+    fn recover_candidates_finds_headerless_jpeg() {
+        let data = make_valid_jpeg_no_soi();
+        let options = default_options(data.len());
+        let result = recover_candidates(&data, options);
+        // At least one candidate should start at offset 0 with missing_soi
+        let main = result.iter().find(|c| c.start == 0 && c.missing_soi);
+        assert!(main.is_some(), "expected a headerless candidate at offset 0");
+        assert_eq!(main.unwrap().status, RecoveryStatus::Recovered);
+    }
+
+    #[test]
+    fn recover_candidates_headerless_not_returned_if_covered_by_soi() {
+        // Normal JPEG with SOI: the APP marker inside it should not produce a headerless candidate
+        let data = make_valid_jpeg();
+        let options = default_options(data.len());
+        let result = recover_candidates(&data, options);
+        // Only the SOI-based candidate, no duplicates
+        assert_eq!(result.len(), 1);
+        assert!(!result[0].missing_soi);
     }
 }

@@ -115,14 +115,15 @@ fn main() {
             for (i, path) in paths.iter().enumerate() {
                 let c = &candidates[i];
                 println!(
-                    "  [{}] {} — start={} end={} status={:?} confidence={:.2}{}",
+                    "  [{}] {} — start={} end={} status={:?} confidence={:.2}{}{}",
                     i,
                     path.display(),
                     c.start,
                     c.end,
                     c.status,
                     c.confidence_score,
-                    if c.patched_eoi { " (EOI patched)" } else { "" }
+                    if c.missing_soi { " (SOI synthesized)" } else { "" },
+                    if c.patched_eoi { " (EOI patched)" } else { "" },
                 );
             }
         }

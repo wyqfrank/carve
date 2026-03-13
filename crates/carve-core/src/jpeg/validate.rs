@@ -1,7 +1,7 @@
 // JPEG validation, truncation policy, and confidence scoring
 use super::candidate::RecoveryStatus;
 use super::entropy::{scan_entropy_stream, EntropyResult, EntropyTerminationReason};
-use super::parse::{parse_until_sos, PreSosResult};
+use super::parse::{parse_until_sos, parse_until_sos_no_soi, PreSosResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidationOptions {
@@ -22,6 +22,7 @@ pub struct ValidatedCandidate {
     pub end: usize, // exclusive
     pub status: RecoveryStatus,
     pub patched_eoi: bool,
+    pub missing_soi: bool,
     pub confidence_score: f32,
     pub has_exif: bool,
     pub has_dqt: bool,
@@ -44,6 +45,25 @@ pub fn validate_candidate(
     let pre_sos = parse_until_sos(bytes, start, options.max_size).ok()?;
     let entropy = scan_entropy_stream(bytes, pre_sos.scan_start, max_end);
     validate_from_parts(start, &pre_sos, &entropy, options)
+}
+
+/// Validate a candidate that starts without an SOI marker.
+///
+/// Calls `parse_until_sos_no_soi` instead of `parse_until_sos`, applies a −10
+/// confidence penalty, and sets `missing_soi: true` on the result. The SOI
+/// prefix (`FF D8`) must be synthesized at extraction time.
+pub fn validate_headerless_candidate(
+    bytes: &[u8],
+    start: usize,
+    options: ValidationOptions,
+) -> Option<ValidatedCandidate> {
+    let max_end = bytes.len().min(start.saturating_add(options.max_size));
+    let pre_sos = parse_until_sos_no_soi(bytes, start, options.max_size).ok()?;
+    let entropy = scan_entropy_stream(bytes, pre_sos.scan_start, max_end);
+    let mut candidate = validate_from_parts(start, &pre_sos, &entropy, options)?;
+    candidate.missing_soi = true;
+    candidate.confidence_score = (candidate.confidence_score - 0.10).max(0.0);
+    Some(candidate)
 }
 
 /// Validate a carved JPEG candidate from pre-computed parse + entropy results.
@@ -95,6 +115,7 @@ pub fn validate_from_parts(
         end,
         status,
         patched_eoi,
+        missing_soi: false,
         confidence_score,
         has_exif: pre_sos.has_exif,
         has_dqt: pre_sos.has_dqt,
@@ -427,5 +448,96 @@ mod tests {
         assert_eq!(candidate.start, start);
         assert_eq!(candidate.end, data.len());
         assert_eq!(candidate.status, RecoveryStatus::Recovered);
+        assert!(!candidate.missing_soi);
+    }
+
+    fn make_headerless_jpeg_bytes() -> Vec<u8> {
+        use super::super::markers;
+        // Same structure as make_valid_jpeg_bytes() but without the leading SOI
+        let mut buf = Vec::new();
+        let mut dqt = vec![0x00u8];
+        dqt.extend_from_slice(&[16u8; 64]);
+        buf.extend(make_segment_bytes(markers::DQT, &dqt));
+        let sof = [0x08, 0x00, 0xF0, 0x01, 0x40, 0x03,
+                   0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01];
+        buf.extend(make_segment_bytes(markers::SOF0, &sof));
+        let sos = [0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00];
+        buf.extend(make_segment_bytes(markers::SOS, &sos));
+        buf.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+        buf.extend_from_slice(&[0xFF, 0xD9]);
+        buf
+    }
+
+    #[test]
+    fn validate_headerless_candidate_sets_missing_soi() {
+        let data = make_headerless_jpeg_bytes();
+        let candidate = validate_headerless_candidate(
+            &data,
+            0,
+            ValidationOptions {
+                allow_truncated: false,
+                max_size: data.len(),
+                patch_eoi: PatchEoiPolicy::None,
+            },
+        )
+        .expect("headerless JPEG should produce a candidate");
+
+        assert!(candidate.missing_soi);
+        assert_eq!(candidate.status, RecoveryStatus::Recovered);
+        assert_eq!(candidate.start, 0);
+        assert_eq!(candidate.end, data.len());
+        assert_eq!(candidate.width, Some(320));
+        assert_eq!(candidate.height, Some(240));
+    }
+
+    #[test]
+    fn validate_headerless_candidate_confidence_lower_than_soi_version() {
+        let headerless = make_headerless_jpeg_bytes();
+        let headerless_candidate = validate_headerless_candidate(
+            &headerless,
+            0,
+            ValidationOptions {
+                allow_truncated: false,
+                max_size: headerless.len(),
+                patch_eoi: PatchEoiPolicy::None,
+            },
+        )
+        .unwrap();
+
+        // Build the equivalent with SOI
+        let mut with_soi = vec![0xFF, super::super::markers::SOI];
+        with_soi.extend_from_slice(&headerless);
+        let soi_candidate = validate_candidate(
+            &with_soi,
+            0,
+            ValidationOptions {
+                allow_truncated: false,
+                max_size: with_soi.len(),
+                patch_eoi: PatchEoiPolicy::None,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            headerless_candidate.confidence_score < soi_candidate.confidence_score,
+            "headerless confidence ({}) should be lower than SOI confidence ({})",
+            headerless_candidate.confidence_score,
+            soi_candidate.confidence_score,
+        );
+    }
+
+    #[test]
+    fn validate_headerless_candidate_rejects_noise() {
+        let data = vec![0x00u8; 64];
+        let result = validate_headerless_candidate(
+            &data,
+            0,
+            ValidationOptions {
+                allow_truncated: true,
+                max_size: data.len(),
+                patch_eoi: PatchEoiPolicy::None,
+            },
+        );
+        assert!(result.is_none());
     }
 }
