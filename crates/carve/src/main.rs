@@ -8,47 +8,42 @@ use carve_core::jpeg::validate::{PatchEoiPolicy, ValidationOptions};
 use carve_core::report::write_report;
 use carve_core::scanner::{apply_validated_overlap_policy, recover_candidates, OverlapOptions};
 
+const USAGE: &str = "Usage: carve [--keep-overlaps] <file> [<file> ...]";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliOptions {
-    file_path: String,
+    file_paths: Vec<String>,
     keep_overlaps: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     if args.len() < 2 {
-        return Err("Usage: carve [--keep-overlaps] <file>".to_string());
+        return Err(USAGE.to_string());
     }
 
     let mut keep_overlaps = false;
-    let mut file_path: Option<String> = None;
+    let mut file_paths: Vec<String> = Vec::new();
 
     for arg in &args[1..] {
         match arg.as_str() {
             "--keep-overlaps" => keep_overlaps = true,
             _ if arg.starts_with('-') => {
-                return Err(format!(
-                    "Unknown flag: {arg}\nUsage: carve [--keep-overlaps] <file>"
-                ));
+                return Err(format!("Unknown flag: {arg}\n{USAGE}"));
             }
             _ => {
-                if file_path.is_some() {
-                    return Err(
-                        "Only one input file is supported.\nUsage: carve [--keep-overlaps] <file>"
-                            .to_string(),
-                    );
-                }
-                file_path = Some(arg.clone());
+                file_paths.push(arg.clone());
             }
         }
     }
 
-    match file_path {
-        Some(path) => Ok(CliOptions {
-            file_path: path,
-            keep_overlaps,
-        }),
-        None => Err("Missing input file.\nUsage: carve [--keep-overlaps] <file>".to_string()),
+    if file_paths.is_empty() {
+        return Err(format!("Missing input file.\n{USAGE}"));
     }
+
+    Ok(CliOptions {
+        file_paths,
+        keep_overlaps,
+    })
 }
 
 fn output_dir_for(input: &str) -> PathBuf {
@@ -57,6 +52,16 @@ fn output_dir_for(input: &str) -> PathBuf {
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
     PathBuf::from("recovered").join(stem)
+}
+
+/// Read and concatenate all input files into a single byte buffer.
+fn read_inputs(paths: &[String]) -> Result<Vec<u8>, (String, std::io::Error)> {
+    let mut bytes = Vec::new();
+    for path in paths {
+        let data = fs::read(path).map_err(|e| (path.clone(), e))?;
+        bytes.extend_from_slice(&data);
+    }
+    Ok(bytes)
 }
 
 fn main() {
@@ -69,19 +74,27 @@ fn main() {
         }
     };
 
-    let bytes = match fs::read(&cli.file_path) {
+    let bytes = match read_inputs(&cli.file_paths) {
         Ok(b) => b,
-        Err(e) => {
-            eprintln!("Error reading '{}': {}", cli.file_path, e);
+        Err((path, e)) => {
+            eprintln!("Error reading '{}': {}", path, e);
             process::exit(1);
         }
     };
 
-    println!(
-        "Scanning: {} ({:.1} KB)",
-        cli.file_path,
-        bytes.len() as f64 / 1024.0
-    );
+    if cli.file_paths.len() == 1 {
+        println!(
+            "Scanning: {} ({:.1} KB)",
+            cli.file_paths[0],
+            bytes.len() as f64 / 1024.0
+        );
+    } else {
+        println!(
+            "Scanning: {} files concatenated ({:.1} KB total)",
+            cli.file_paths.len(),
+            bytes.len() as f64 / 1024.0
+        );
+    }
 
     let validation_options = ValidationOptions {
         allow_truncated: true,
@@ -104,7 +117,7 @@ fn main() {
         return;
     }
 
-    let out_dir = output_dir_for(&cli.file_path);
+    let out_dir = output_dir_for(&cli.file_paths[0]);
     if let Err(e) = fs::create_dir_all(&out_dir) {
         eprintln!("Failed to create output directory '{}': {}", out_dir.display(), e);
         process::exit(1);
@@ -151,16 +164,23 @@ mod tests {
     }
 
     #[test]
-    fn parses_without_flag() {
+    fn parses_single_file() {
         let parsed = parse_args(&args(&["carve", "image.jpg"])).unwrap();
-        assert_eq!(parsed.file_path, "image.jpg");
+        assert_eq!(parsed.file_paths, vec!["image.jpg"]);
         assert!(!parsed.keep_overlaps);
     }
 
     #[test]
-    fn parses_keep_overlaps_flag() {
-        let parsed = parse_args(&args(&["carve", "--keep-overlaps", "image.jpg"])).unwrap();
-        assert_eq!(parsed.file_path, "image.jpg");
+    fn parses_multiple_files() {
+        let parsed = parse_args(&args(&["carve", "a.jpg", "b.jpg", "c.jpg"])).unwrap();
+        assert_eq!(parsed.file_paths, vec!["a.jpg", "b.jpg", "c.jpg"]);
+        assert!(!parsed.keep_overlaps);
+    }
+
+    #[test]
+    fn parses_keep_overlaps_with_multiple_files() {
+        let parsed = parse_args(&args(&["carve", "--keep-overlaps", "a.jpg", "b.jpg"])).unwrap();
+        assert_eq!(parsed.file_paths, vec!["a.jpg", "b.jpg"]);
         assert!(parsed.keep_overlaps);
     }
 
@@ -171,9 +191,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_no_files() {
+        let err = parse_args(&args(&["carve"])).unwrap_err();
+        assert!(err.contains("Usage"));
+    }
+
+    #[test]
+    fn rejects_only_flag_no_file() {
+        let err = parse_args(&args(&["carve", "--keep-overlaps"])).unwrap_err();
+        assert!(err.contains("Missing input file"));
+    }
+
+    #[test]
     fn output_dir_derives_from_stem() {
         assert_eq!(output_dir_for("image.jpg"), PathBuf::from("recovered").join("image"));
         assert_eq!(output_dir_for("dump.bin"), PathBuf::from("recovered").join("dump"));
         assert_eq!(output_dir_for("no_ext"), PathBuf::from("recovered").join("no_ext"));
     }
 }
+
