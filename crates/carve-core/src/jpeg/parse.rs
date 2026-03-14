@@ -126,7 +126,26 @@ pub fn parse_until_sos(bytes: &[u8], start: usize, max_size_bytes: usize) -> Res
         return Err(ParseError::NotJpeg);
     }
 
-    let mut pos = start + 2;
+    parse_header_segments(bytes, start + 2, limit)
+}
+
+/// Variant of `parse_until_sos` that skips the SOI check.
+///
+/// Begins parsing markers directly from `start`, allowing the caller to process
+/// JPEG data that omits the leading `FF D8` SOI marker. Otherwise behaves
+/// identically to `parse_until_sos`.
+pub fn parse_until_sos_no_soi(bytes: &[u8], start: usize, max_size_bytes: usize) -> Result<PreSosResult, ParseError> {
+    let limit = bytes.len().min(start.saturating_add(max_size_bytes));
+
+    if start >= limit {
+        return Err(ParseError::OutOfBounds);
+    }
+
+    parse_header_segments(bytes, start, limit)
+}
+
+fn parse_header_segments(bytes: &[u8], pos_start: usize, limit: usize) -> Result<PreSosResult, ParseError> {
+    let mut pos = pos_start;
     let mut segments_parsed = 0usize;
 
     let mut has_exif = false;
@@ -191,7 +210,7 @@ pub fn parse_until_sos(bytes: &[u8], start: usize, max_size_bytes: usize) -> Res
             // Refactored to use meta::parse_sof_metadata
             let payload = &bytes[seg.payload_pos..(seg.payload_pos + seg.payload_len)];
             let is_prog = seg.marker == markers::SOF2;
-            
+
             match crate::jpeg::meta::parse_sof_metadata(payload, is_prog) {
                 Ok(m) => {
                     width = Some(m.width as u16);
@@ -481,6 +500,57 @@ mod tests {
     fn parse_until_sos_random_noise() {
         let noise: Vec<u8> = (0..256).map(|i| (i * 37 % 256) as u8).collect();
         assert!(parse_until_sos(&noise, 0, noise.len()).is_err());
+    }
+
+    // parse_until_sos_no_soi
+
+    #[test]
+    fn parse_until_sos_no_soi_success_app0_then_dqt_then_sos() {
+        // APP0 + DQT + SOS with no leading SOI
+        let mut buf = Vec::new();
+        let app0_payload = b"JFIF\0\x01\x01\x00\x00\x48\x00\x48\x00\x00";
+        buf.extend(make_segment(0xE0, app0_payload));
+        buf.extend(make_segment(markers::DQT, &[0; 4]));
+        buf.extend(make_segment(markers::SOS, &[0; 4]));
+
+        let result = parse_until_sos_no_soi(&buf, 0, buf.len()).unwrap();
+        assert!(result.has_dqt);
+        assert!(!result.has_exif);
+        assert_eq!(result.segments_parsed, 3); // APP0 + DQT + SOS
+    }
+
+    #[test]
+    fn parse_until_sos_no_soi_dqt_only() {
+        let mut buf = Vec::new();
+        buf.extend(make_segment(markers::DQT, &[0; 4]));
+        buf.extend(make_segment(markers::SOS, &[0; 4]));
+
+        let result = parse_until_sos_no_soi(&buf, 0, buf.len()).unwrap();
+        assert!(result.has_dqt);
+        assert_eq!(result.segments_parsed, 2);
+    }
+
+    #[test]
+    fn parse_until_sos_no_soi_rejects_noise() {
+        let noise: Vec<u8> = (0..256).map(|i| (i * 37 % 256) as u8).collect();
+        assert!(parse_until_sos_no_soi(&noise, 0, noise.len()).is_err());
+    }
+
+    #[test]
+    fn parse_until_sos_no_soi_rejects_if_soi_present_at_start() {
+        // If data starts with FF D8 (SOI), the no-soi variant should reject it
+        // because read_marker returns SOI and the SOI check triggers an error.
+        let mut buf = vec![0xFF, markers::SOI];
+        buf.extend(make_segment(markers::DQT, &[0; 4]));
+        buf.extend(make_segment(markers::SOS, &[0; 4]));
+
+        let err = parse_until_sos_no_soi(&buf, 0, buf.len()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidMarkerStream { .. }));
+    }
+
+    #[test]
+    fn parse_until_sos_no_soi_empty() {
+        assert!(parse_until_sos_no_soi(&[], 0, 0).is_err());
     }
 
     #[test]

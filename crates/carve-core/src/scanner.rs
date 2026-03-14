@@ -1,0 +1,709 @@
+use crate::jpeg::candidate::{Candidate, RecoveryStatus};
+use crate::jpeg::markers;
+use crate::jpeg::validate::{
+    validate_candidate, validate_headerless_candidate, ValidatedCandidate, ValidationOptions,
+};
+
+/// Scan `bytes` for all SOI markers (FF D8) and return their offsets in order.
+fn find_soi_offsets(bytes: &[u8]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let len = bytes.len().saturating_sub(1);
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == 0xFF && bytes[i + 1] == markers::SOI {
+            offsets.push(i);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    offsets
+}
+
+/// Scan `bytes` for JPEG header-region markers (APP0–APPF, DQT, SOF0, SOF2) that
+/// are not already covered by any SOI-based candidate range.
+///
+/// Returns candidate start offsets for potential headerless JPEGs in order.
+fn find_headerless_candidates(bytes: &[u8], soi_candidates: &[ValidatedCandidate]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let len = bytes.len().saturating_sub(1);
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == 0xFF {
+            let marker = bytes[i + 1];
+            let is_header_marker = markers::is_app(marker)
+                || marker == markers::DQT
+                || marker == markers::SOF0
+                || marker == markers::SOF2;
+            if is_header_marker {
+                // Exclude positions that are immediately inside an SOI sequence
+                // (i.e. 2 bytes after an SOI marker, which means we already found
+                // this JPEG via the SOI path).
+                let after_soi = i >= 2
+                    && bytes[i - 2] == 0xFF
+                    && bytes[i - 1] == markers::SOI;
+                // Exclude positions within an existing SOI-based candidate range
+                let in_soi_range = soi_candidates
+                    .iter()
+                    .any(|c| i >= c.start && i < c.end);
+                if !after_soi && !in_soi_range {
+                    offsets.push(i);
+                }
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    offsets
+}
+
+/// Attempt validation at every SOI offset and collect successful candidates.
+///
+/// Also scans for headerless JPEG candidates (APP/DQT/SOF markers without a
+/// leading SOI) and merges them with SOI-based results. Results are returned
+/// in start-offset order (deterministic).
+pub fn recover_candidates(bytes: &[u8], options: ValidationOptions) -> Vec<ValidatedCandidate> {
+    // SOI-based candidates (existing behavior)
+    let mut soi_candidates: Vec<ValidatedCandidate> = find_soi_offsets(bytes)
+        .into_iter()
+        .filter_map(|start| validate_candidate(bytes, start, options))
+        .collect();
+
+    // Headerless candidates not already covered by SOI ranges
+    let headerless: Vec<ValidatedCandidate> =
+        find_headerless_candidates(bytes, &soi_candidates)
+            .into_iter()
+            .filter_map(|start| validate_headerless_candidate(bytes, start, options))
+            .collect();
+
+    soi_candidates.extend(headerless);
+    soi_candidates.sort_by_key(|c| c.start);
+    soi_candidates
+}
+
+/// Apply overlap suppression to a list of `ValidatedCandidate` results.
+///
+/// When `keep_overlaps=false` (default), overlapping candidates are suppressed:
+/// candidates are sorted by start asc then end desc (longer span first), and
+/// a greedy scan emits a candidate only when its start >= the previous emitted end.
+/// This ensures recovered (longer) candidates beat truncated (shorter) ones at the
+/// same start position, and nested/partially-overlapping candidates are dropped.
+pub fn apply_validated_overlap_policy(
+    mut candidates: Vec<ValidatedCandidate>,
+    options: OverlapOptions,
+) -> Vec<ValidatedCandidate> {
+    if options.keep_overlaps {
+        return candidates;
+    }
+
+    // Sort: start asc, then end desc (longer span first), then recovered before truncated.
+    candidates.sort_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then_with(|| b.end.cmp(&a.end))
+            .then_with(|| validated_status_rank(a.status).cmp(&validated_status_rank(b.status)))
+    });
+
+    let mut out: Vec<ValidatedCandidate> = Vec::new();
+    let mut last_end: usize = 0;
+
+    for c in candidates {
+        if c.start >= last_end {
+            last_end = c.end;
+            out.push(c);
+        }
+    }
+
+    out
+}
+
+#[inline]
+fn validated_status_rank(status: RecoveryStatus) -> u8 {
+    match status {
+        RecoveryStatus::Recovered => 0,
+        RecoveryStatus::Truncated => 1,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlapOptions {
+    pub keep_overlaps: bool,
+}
+
+impl Default for OverlapOptions {
+    fn default() -> Self {
+        Self {
+            keep_overlaps: false,
+        }
+    }
+}
+
+/// Apply overlap policy to validated candidates.
+///
+/// Default behavior suppresses overlaps. Setting `keep_overlaps=true`
+/// returns candidates unchanged.
+pub fn apply_overlap_policy(candidates: Vec<Candidate>, options: OverlapOptions) -> Vec<Candidate> {
+    if options.keep_overlaps {
+        candidates
+    } else {
+        suppress_overlapping_candidates(candidates)
+    }
+}
+
+/// Suppress overlapping candidate ranges deterministically.
+///
+/// Rules:
+/// - Sort by start ascending, then end ascending.
+/// - Group connected overlaps into clusters.
+/// - For each cluster, emit the strongest candidate using deterministic ranking:
+///   complete > truncated, larger span preferred, then earlier start.
+pub fn suppress_overlapping_candidates(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
+    candidates.sort_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then_with(|| a.end.cmp(&b.end))
+            .then_with(|| status_rank(a.status).cmp(&status_rank(b.status)))
+    });
+
+    let mut emitted: Vec<Candidate> = Vec::with_capacity(candidates.len());
+    let mut cluster_best: Option<Candidate> = None;
+    let mut cluster_end: usize = 0;
+
+    for candidate in candidates {
+        match cluster_best {
+            None => {
+                cluster_end = candidate.end;
+                cluster_best = Some(candidate);
+            }
+            Some(best) => {
+                if candidate.start >= cluster_end {
+                    emitted.push(best);
+                    cluster_end = candidate.end;
+                    cluster_best = Some(candidate);
+                    continue;
+                }
+
+                cluster_end = cluster_end.max(candidate.end);
+                if candidate_is_stronger(candidate, best) {
+                    cluster_best = Some(candidate);
+                }
+            }
+        }
+    }
+
+    if let Some(best) = cluster_best {
+        emitted.push(best);
+    }
+
+    emitted
+}
+
+#[inline]
+fn status_rank(status: RecoveryStatus) -> u8 {
+    match status {
+        RecoveryStatus::Recovered => 0,
+        RecoveryStatus::Truncated => 1,
+    }
+}
+
+#[inline]
+fn is_complete(candidate: Candidate) -> bool {
+    matches!(candidate.status, RecoveryStatus::Recovered)
+}
+
+#[inline]
+fn span(candidate: Candidate) -> usize {
+    candidate.end.saturating_sub(candidate.start)
+}
+
+fn candidate_is_stronger(lhs: Candidate, rhs: Candidate) -> bool {
+    if is_complete(lhs) != is_complete(rhs) {
+        return is_complete(lhs);
+    }
+
+    let lhs_span = span(lhs);
+    let rhs_span = span(rhs);
+    if lhs_span != rhs_span {
+        return lhs_span > rhs_span;
+    }
+
+    if lhs.start != rhs.start {
+        return lhs.start < rhs.start;
+    }
+
+    if lhs.end != rhs.end {
+        return lhs.end < rhs.end;
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn c(start: usize, end: usize, status: RecoveryStatus) -> Candidate {
+        Candidate { start, end, status }
+    }
+
+    #[test]
+    fn suppresses_nested_candidates() {
+        let input = vec![
+            c(10, 100, RecoveryStatus::Recovered),
+            c(20, 80, RecoveryStatus::Recovered),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(out, vec![c(10, 100, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn suppresses_partially_overlapping_candidates() {
+        let input = vec![
+            c(0, 50, RecoveryStatus::Recovered),
+            c(40, 90, RecoveryStatus::Recovered),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(out, vec![c(0, 50, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn keeps_non_overlapping_candidates() {
+        let input = vec![
+            c(0, 50, RecoveryStatus::Recovered),
+            c(50, 100, RecoveryStatus::Recovered),
+            c(120, 150, RecoveryStatus::Truncated),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(
+            out,
+            vec![
+                c(0, 50, RecoveryStatus::Recovered),
+                c(50, 100, RecoveryStatus::Recovered),
+                c(120, 150, RecoveryStatus::Truncated)
+            ]
+        );
+    }
+
+    #[test]
+    fn identical_ranges_emit_only_one() {
+        let input = vec![
+            c(10, 40, RecoveryStatus::Recovered),
+            c(10, 40, RecoveryStatus::Recovered),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(out, vec![c(10, 40, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn identical_ranges_prefers_complete_over_truncated() {
+        let input = vec![
+            c(10, 40, RecoveryStatus::Truncated),
+            c(10, 40, RecoveryStatus::Recovered),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(out, vec![c(10, 40, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn same_start_overlap_prefers_complete() {
+        let input = vec![
+            c(10, 20, RecoveryStatus::Truncated),
+            c(10, 100, RecoveryStatus::Recovered),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(out, vec![c(10, 100, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn overlap_prefers_complete_even_with_later_start() {
+        let input = vec![
+            c(10, 100, RecoveryStatus::Truncated),
+            c(20, 80, RecoveryStatus::Recovered),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(out, vec![c(20, 80, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn overlap_does_not_replace_complete_with_truncated() {
+        let input = vec![
+            c(10, 100, RecoveryStatus::Recovered),
+            c(20, 80, RecoveryStatus::Truncated),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(out, vec![c(10, 100, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn nested_candidates_prefer_larger_span() {
+        let input = vec![
+            c(10, 120, RecoveryStatus::Recovered),
+            c(20, 80, RecoveryStatus::Recovered),
+            c(30, 70, RecoveryStatus::Recovered),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(out, vec![c(10, 120, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn connected_overlap_cluster_selects_single_strongest_candidate() {
+        let input = vec![
+            c(0, 10, RecoveryStatus::Recovered),
+            c(5, 20, RecoveryStatus::Recovered),
+            c(15, 40, RecoveryStatus::Recovered),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(out, vec![c(15, 40, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn same_status_and_span_prefers_earlier_start() {
+        let input = vec![
+            c(10, 30, RecoveryStatus::Recovered),
+            c(12, 32, RecoveryStatus::Recovered),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(out, vec![c(10, 30, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn ordering_is_deterministic_for_unsorted_input() {
+        let input = vec![
+            c(100, 120, RecoveryStatus::Recovered),
+            c(10, 90, RecoveryStatus::Recovered),
+            c(90, 100, RecoveryStatus::Recovered),
+            c(10, 90, RecoveryStatus::Recovered),
+            c(30, 50, RecoveryStatus::Recovered),
+        ];
+        let out = suppress_overlapping_candidates(input);
+        assert_eq!(
+            out,
+            vec![
+                c(10, 90, RecoveryStatus::Recovered),
+                c(90, 100, RecoveryStatus::Recovered),
+                c(100, 120, RecoveryStatus::Recovered)
+            ]
+        );
+    }
+
+    #[test]
+    fn default_mode_suppresses_overlaps() {
+        let input = vec![
+            c(0, 50, RecoveryStatus::Recovered),
+            c(40, 90, RecoveryStatus::Recovered),
+        ];
+        let out = apply_overlap_policy(input, OverlapOptions::default());
+        assert_eq!(out, vec![c(0, 50, RecoveryStatus::Recovered)]);
+    }
+
+    #[test]
+    fn keep_overlaps_mode_emits_all_candidates() {
+        let input = vec![
+            c(0, 50, RecoveryStatus::Recovered),
+            c(40, 90, RecoveryStatus::Recovered),
+        ];
+        let out = apply_overlap_policy(
+            input.clone(),
+            OverlapOptions {
+                keep_overlaps: true,
+            },
+        );
+        assert_eq!(out, input);
+    }
+
+    // --- find_soi_offsets tests ---
+
+    #[test]
+    fn find_soi_offsets_empty() {
+        assert!(find_soi_offsets(&[]).is_empty());
+    }
+
+    #[test]
+    fn find_soi_offsets_single() {
+        let data = [0xFF, markers::SOI, 0x00, 0x00];
+        assert_eq!(find_soi_offsets(&data), vec![0]);
+    }
+
+    #[test]
+    fn find_soi_offsets_multiple() {
+        let mut data = vec![0x00u8; 10];
+        data[2] = 0xFF; data[3] = markers::SOI;
+        data[7] = 0xFF; data[8] = markers::SOI;
+        assert_eq!(find_soi_offsets(&data), vec![2, 7]);
+    }
+
+    #[test]
+    fn find_soi_offsets_no_soi_in_noise() {
+        let data = vec![0xAB, 0xCD, 0xEF, 0xFF, 0x00, 0xFF, 0xD7];
+        assert!(find_soi_offsets(&data).is_empty());
+    }
+
+    #[test]
+    fn find_soi_at_last_byte_not_counted() {
+        // FF at the very last byte has no following byte — must not panic or count it
+        let data = [0x00, 0xFF];
+        assert!(find_soi_offsets(&data).is_empty());
+    }
+
+    // --- recover_candidates tests ---
+
+    fn make_segment_bytes(marker: u8, payload: &[u8]) -> Vec<u8> {
+        let len = (payload.len() + 2) as u16;
+        let mut v = vec![0xFF, marker, (len >> 8) as u8, len as u8];
+        v.extend_from_slice(payload);
+        v
+    }
+
+    fn make_valid_jpeg() -> Vec<u8> {
+        let mut buf = vec![0xFF, markers::SOI];
+        let mut dqt = vec![0x00u8]; dqt.extend_from_slice(&[16u8; 64]);
+        buf.extend(make_segment_bytes(markers::DQT, &dqt));
+        let sof = [0x08, 0x00, 0xF0, 0x01, 0x40, 0x03,
+                   0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01];
+        buf.extend(make_segment_bytes(markers::SOF0, &sof));
+        let sos = [0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00];
+        buf.extend(make_segment_bytes(markers::SOS, &sos));
+        buf.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+        buf.extend_from_slice(&[0xFF, 0xD9]);
+        buf
+    }
+
+    fn default_options(data_len: usize) -> ValidationOptions {
+        use crate::jpeg::validate::PatchEoiPolicy;
+        ValidationOptions { allow_truncated: false, max_size: data_len, patch_eoi: PatchEoiPolicy::None }
+    }
+
+    #[test]
+    fn recover_candidates_empty_bytes_returns_empty() {
+        let result = recover_candidates(&[], default_options(0));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn recover_candidates_noise_returns_empty() {
+        let data = vec![0xABu8; 256];
+        let result = recover_candidates(&data, default_options(data.len()));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn recover_candidates_single_valid_jpeg() {
+        let data = make_valid_jpeg();
+        let result = recover_candidates(&data, default_options(data.len()));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].start, 0);
+        assert_eq!(result[0].end, data.len());
+        assert_eq!(result[0].status, RecoveryStatus::Recovered);
+    }
+
+    #[test]
+    fn recover_candidates_invalid_soi_is_skipped() {
+        // SOI followed by garbage — parse fails, no candidate
+        let mut data = vec![0xFF, markers::SOI];
+        data.extend_from_slice(&[0x00u8; 32]);
+        let result = recover_candidates(&data, default_options(data.len()));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn recover_candidates_two_jpegs_concatenated() {
+        let jpeg = make_valid_jpeg();
+        let mut data = jpeg.clone();
+        data.extend_from_slice(&jpeg);
+        let result = recover_candidates(&data, default_options(data.len()));
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].start, 0);
+        assert_eq!(result[1].start, jpeg.len());
+    }
+
+    #[test]
+    fn recover_candidates_results_in_offset_order() {
+        let jpeg = make_valid_jpeg();
+        let mut data = vec![0xFFu8; 16]; // garbage prefix
+        data.extend_from_slice(&jpeg);
+        let result = recover_candidates(&data, default_options(data.len()));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].start, 16);
+    }
+
+    // --- apply_validated_overlap_policy tests ---
+
+    fn make_validated(start: usize, end: usize, status: RecoveryStatus) -> ValidatedCandidate {
+        let confidence = if status == RecoveryStatus::Recovered { 0.8 } else { 0.5 };
+        ValidatedCandidate {
+            start, end, status,
+            patched_eoi: false,
+            missing_soi: false,
+            confidence_score: confidence,
+            has_exif: false,
+            has_dqt: true,
+            has_dht: false,
+            width: Some(320),
+            height: Some(240),
+            is_progressive: Some(false),
+        }
+    }
+
+    fn v(start: usize, end: usize, status: RecoveryStatus) -> ValidatedCandidate {
+        make_validated(start, end, status)
+    }
+
+    #[test]
+    fn validated_suppression_keeps_non_overlapping() {
+        let input = vec![
+            v(0, 50, RecoveryStatus::Recovered),
+            v(50, 100, RecoveryStatus::Recovered),
+            v(120, 150, RecoveryStatus::Truncated),
+        ];
+        let out = apply_validated_overlap_policy(input, OverlapOptions::default());
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].start, 0);
+        assert_eq!(out[1].start, 50);
+        assert_eq!(out[2].start, 120);
+    }
+
+    #[test]
+    fn validated_suppression_drops_nested_candidate() {
+        let input = vec![
+            v(0, 100, RecoveryStatus::Recovered),
+            v(20, 80, RecoveryStatus::Recovered), // nested
+        ];
+        let out = apply_validated_overlap_policy(input, OverlapOptions::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].start, 0);
+        assert_eq!(out[0].end, 100);
+    }
+
+    #[test]
+    fn validated_suppression_drops_partial_overlap() {
+        let input = vec![
+            v(0, 60, RecoveryStatus::Recovered),
+            v(40, 100, RecoveryStatus::Recovered), // overlaps
+        ];
+        let out = apply_validated_overlap_policy(input, OverlapOptions::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].start, 0);
+    }
+
+    #[test]
+    fn validated_suppression_recovered_beats_truncated_same_start() {
+        let input = vec![
+            v(0, 30, RecoveryStatus::Truncated),
+            v(0, 100, RecoveryStatus::Recovered),
+        ];
+        let out = apply_validated_overlap_policy(input, OverlapOptions::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, RecoveryStatus::Recovered);
+        assert_eq!(out[0].end, 100);
+    }
+
+    #[test]
+    fn validated_suppression_duplicate_ranges_emit_one() {
+        let input = vec![
+            v(10, 50, RecoveryStatus::Recovered),
+            v(10, 50, RecoveryStatus::Recovered),
+        ];
+        let out = apply_validated_overlap_policy(input, OverlapOptions::default());
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn validated_keep_overlaps_emits_all() {
+        let input = vec![
+            v(0, 100, RecoveryStatus::Recovered),
+            v(20, 80, RecoveryStatus::Recovered),
+        ];
+        let out = apply_validated_overlap_policy(input.clone(), OverlapOptions { keep_overlaps: true });
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn validated_suppression_empty_input() {
+        let out = apply_validated_overlap_policy(vec![], OverlapOptions::default());
+        assert!(out.is_empty());
+    }
+
+    // --- find_headerless_candidates tests ---
+
+    #[test]
+    fn find_headerless_app0_at_start_returned() {
+        // Data starts with FF E0 (APP0) — no preceding SOI
+        let data = [0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00];
+        let offsets = find_headerless_candidates(&data, &[]);
+        assert_eq!(offsets, vec![0]);
+    }
+
+    #[test]
+    fn find_headerless_dqt_at_start_returned() {
+        let data = [0xFF, markers::DQT, 0x00, 0x04, 0x00, 0x00];
+        let offsets = find_headerless_candidates(&data, &[]);
+        assert_eq!(offsets, vec![0]);
+    }
+
+    #[test]
+    fn find_headerless_app0_after_soi_excluded() {
+        // FF D8 FF E0 ... — APP0 immediately after SOI, should be excluded
+        let data = [0xFF, markers::SOI, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00];
+        let offsets = find_headerless_candidates(&data, &[]);
+        assert!(offsets.is_empty());
+    }
+
+    #[test]
+    fn find_headerless_marker_inside_soi_candidate_excluded() {
+        // APP0 at offset 10, but it's within an SOI candidate [0, 50)
+        let mut data = vec![0x00u8; 50];
+        data[10] = 0xFF;
+        data[11] = 0xE0;
+        let soi_cand = make_validated(0, 50, RecoveryStatus::Recovered);
+        let offsets = find_headerless_candidates(&data, &[soi_cand]);
+        assert!(offsets.is_empty());
+    }
+
+    #[test]
+    fn find_headerless_noise_returns_empty() {
+        // Random bytes without any header markers
+        let data = vec![0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let offsets = find_headerless_candidates(&data, &[]);
+        assert!(offsets.is_empty());
+    }
+
+    // --- recover_candidates with headerless input ---
+
+    fn make_valid_jpeg_no_soi() -> Vec<u8> {
+        // Valid JPEG structure without the leading FF D8
+        let mut buf = Vec::new();
+        let mut dqt = vec![0x00u8]; dqt.extend_from_slice(&[16u8; 64]);
+        buf.extend(make_segment_bytes(markers::DQT, &dqt));
+        let sof = [0x08, 0x00, 0xF0, 0x01, 0x40, 0x03,
+                   0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01];
+        buf.extend(make_segment_bytes(markers::SOF0, &sof));
+        let sos = [0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00];
+        buf.extend(make_segment_bytes(markers::SOS, &sos));
+        buf.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+        buf.extend_from_slice(&[0xFF, 0xD9]);
+        buf
+    }
+
+    #[test]
+    fn recover_candidates_finds_headerless_jpeg() {
+        let data = make_valid_jpeg_no_soi();
+        let options = default_options(data.len());
+        let result = recover_candidates(&data, options);
+        // At least one candidate should start at offset 0 with missing_soi
+        let main = result.iter().find(|c| c.start == 0 && c.missing_soi);
+        assert!(main.is_some(), "expected a headerless candidate at offset 0");
+        assert_eq!(main.unwrap().status, RecoveryStatus::Recovered);
+    }
+
+    #[test]
+    fn recover_candidates_headerless_not_returned_if_covered_by_soi() {
+        // Normal JPEG with SOI: the APP marker inside it should not produce a headerless candidate
+        let data = make_valid_jpeg();
+        let options = default_options(data.len());
+        let result = recover_candidates(&data, options);
+        // Only the SOI-based candidate, no duplicates
+        assert_eq!(result.len(), 1);
+        assert!(!result[0].missing_soi);
+    }
+}
