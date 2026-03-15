@@ -52,6 +52,7 @@ mod tests {
             end_offset,
             reason,
             restart_markers_seen: 0,
+            last_rst_marker: None,
         }
     }
 

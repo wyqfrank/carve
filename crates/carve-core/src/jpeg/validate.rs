@@ -30,6 +30,12 @@ pub struct ValidatedCandidate {
     pub width: Option<u16>,
     pub height: Option<u16>,
     pub is_progressive: Option<bool>,
+    /// The last RST0–RST7 marker byte seen in the entropy stream, if any.
+    ///
+    /// When a candidate is truncated at a cluster boundary, this value
+    /// identifies which RST marker the stream ended on. The expected next
+    /// RST marker in a continuation cluster is `next_rst(last_rst_marker)`.
+    pub last_rst_marker: Option<u8>,
 }
 
 /// End-to-end validation pipeline: parse → entropy scan → validated candidate.
@@ -123,6 +129,7 @@ pub fn validate_from_parts(
         width: pre_sos.width,
         height: pre_sos.height,
         is_progressive: pre_sos.is_progressive,
+        last_rst_marker: entropy.last_rst_marker,
     })
 }
 
@@ -175,6 +182,7 @@ mod tests {
             end_offset,
             reason,
             restart_markers_seen: 0,
+            last_rst_marker: None,
         }
     }
 
