@@ -161,6 +161,7 @@ mod tests {
             width: Some(2992),
             height: Some(2992),
             is_progressive: Some(false),
+            last_rst_marker: None,
         }
     }
 

@@ -22,6 +22,19 @@ pub struct EntropyResult {
     pub reason: EntropyTerminationReason,
     /// Number of RST0..RST7 markers seen.
     pub restart_markers_seen: u32,
+    /// The last RST marker byte (0xD0–0xD7) encountered, if any.
+    ///
+    /// Used by fragment search to determine the expected next RST marker
+    /// when scanning candidate continuation clusters.
+    pub last_rst_marker: Option<u8>,
+}
+
+/// Return the next restart marker in the cyclic RST0–RST7 sequence.
+///
+/// RST markers cycle from 0xD0 (RST0) through 0xD7 (RST7) and wrap back to 0xD0.
+pub fn next_rst(rst_marker: u8) -> u8 {
+    debug_assert!((0xD0..=0xD7).contains(&rst_marker));
+    0xD0 + ((rst_marker - 0xD0 + 1) % 8)
 }
 
 /// Scan the JPEG entropy-coded data stream.
@@ -39,6 +52,7 @@ pub fn scan_entropy_stream(bytes: &[u8], start: usize, max_end: usize) -> Entrop
     let limit = max_end.min(bytes.len());
     let mut pos = start.min(limit);
     let mut restart_markers_seen = 0u32;
+    let mut last_rst_marker: Option<u8> = None;
 
     while pos < limit {
         if bytes[pos] != 0xFF {
@@ -58,6 +72,7 @@ pub fn scan_entropy_stream(bytes: &[u8], start: usize, max_end: usize) -> Entrop
                 end_offset: pos,
                 reason: boundary_reason(limit, max_end, bytes.len()),
                 restart_markers_seen,
+                last_rst_marker,
             };
         }
 
@@ -71,6 +86,7 @@ pub fn scan_entropy_stream(bytes: &[u8], start: usize, max_end: usize) -> Entrop
             0xD0..=0xD7 => {
                 // Restart marker RST0..RST7 — valid inside entropy data.
                 restart_markers_seen += 1;
+                last_rst_marker = Some(marker);
                 pos = next + 1;
             }
             0xD9 => {
@@ -79,6 +95,7 @@ pub fn scan_entropy_stream(bytes: &[u8], start: usize, max_end: usize) -> Entrop
                     end_offset: pos,
                     reason: EntropyTerminationReason::Eoi,
                     restart_markers_seen,
+                    last_rst_marker,
                 };
             }
             _ => {
@@ -87,6 +104,7 @@ pub fn scan_entropy_stream(bytes: &[u8], start: usize, max_end: usize) -> Entrop
                     end_offset: pos,
                     reason: EntropyTerminationReason::UnexpectedMarker { marker },
                     restart_markers_seen,
+                    last_rst_marker,
                 };
             }
         }
@@ -96,6 +114,7 @@ pub fn scan_entropy_stream(bytes: &[u8], start: usize, max_end: usize) -> Entrop
         end_offset: limit,
         reason: boundary_reason(limit, max_end, bytes.len()),
         restart_markers_seen,
+        last_rst_marker,
     }
 }
 
@@ -118,6 +137,7 @@ mod tests {
             end_offset: pos,
             reason: EntropyTerminationReason::Eoi,
             restart_markers_seen: 0,
+            last_rst_marker: None,
         }
     }
 
@@ -126,6 +146,7 @@ mod tests {
             end_offset: at,
             reason: EntropyTerminationReason::UnexpectedMarker { marker },
             restart_markers_seen: 0,
+            last_rst_marker: None,
         }
     }
 
@@ -367,5 +388,51 @@ mod tests {
         assert_eq!(r.reason, EntropyTerminationReason::Eoi);
         assert_eq!(r.end_offset, eoi_pos);
         assert_eq!(r.restart_markers_seen, 1);
+        assert_eq!(r.last_rst_marker, Some(0xD3));
+    }
+
+    // last_rst_marker tracking
+
+    #[test]
+    fn last_rst_marker_none_when_no_rst_seen() {
+        let data = [0xAB, 0xCD, 0xFF, 0xD9];
+        let r = scan_entropy_stream(&data, 0, data.len());
+        assert_eq!(r.last_rst_marker, None);
+    }
+
+    #[test]
+    fn last_rst_marker_tracks_most_recent_rst() {
+        // RST2, RST5, RST7 — last should be RST7
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(&[0xFF, 0xD2]); // RST2
+        data.extend_from_slice(&[0x10, 0x20]);
+        data.extend_from_slice(&[0xFF, 0xD5]); // RST5
+        data.extend_from_slice(&[0x30, 0x40]);
+        data.extend_from_slice(&[0xFF, 0xD7]); // RST7
+        data.extend_from_slice(&[0x50]);
+        data.extend_from_slice(&[0xFF, 0xD9]); // EOI
+
+        let r = scan_entropy_stream(&data, 0, data.len());
+        assert_eq!(r.last_rst_marker, Some(0xD7));
+        assert_eq!(r.restart_markers_seen, 3);
+    }
+
+    #[test]
+    fn last_rst_marker_preserved_on_truncation() {
+        // RST3 is seen, then data ends (OutOfBounds) — last_rst_marker should be Some(RST3)
+        let data = [0xAB, 0xFF, 0xD3, 0xCD, 0xEF];
+        let r = scan_entropy_stream(&data, 0, data.len());
+        assert_eq!(r.reason, EntropyTerminationReason::OutOfBounds);
+        assert_eq!(r.last_rst_marker, Some(0xD3));
+    }
+
+    // next_rst
+
+    #[test]
+    fn next_rst_cycles_through_sequence() {
+        assert_eq!(next_rst(0xD0), 0xD1); // RST0 → RST1
+        assert_eq!(next_rst(0xD3), 0xD4); // RST3 → RST4
+        assert_eq!(next_rst(0xD6), 0xD7); // RST6 → RST7
+        assert_eq!(next_rst(0xD7), 0xD0); // RST7 wraps to RST0
     }
 }
