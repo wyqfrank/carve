@@ -19,6 +19,7 @@ Thumbs.db
 .claude/
 CLAUDE.md
 SPEC.md
+docs/canon_ixus_310hs_profile_analysis.md
 
 # fixtures (private photos)
 crates/carve-core/tests/fixtures/*
