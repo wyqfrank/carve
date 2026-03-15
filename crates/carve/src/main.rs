@@ -8,7 +8,7 @@ use carve_core::jpeg::validate::{PatchEoiPolicy, ValidationOptions};
 use carve_core::report::write_report;
 use carve_core::scanner::{apply_validated_overlap_policy, recover_candidates, OverlapOptions};
 
-const USAGE: &str = "Usage: carve [--keep-overlaps] <file> [<file> ...]";
+const USAGE: &str = "Usage: carve [--keep-overlaps] <file|pattern> [<file|pattern> ...]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliOptions {
@@ -31,7 +31,22 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
                 return Err(format!("Unknown flag: {arg}\n{USAGE}"));
             }
             _ => {
-                file_paths.push(arg.clone());
+                // If the argument contains glob characters, expand it;
+                // otherwise treat it as a literal file path.
+                if arg.contains('*') || arg.contains('?') || arg.contains('[') {
+                    let mut matches: Vec<String> = glob::glob(arg)
+                        .map_err(|e| format!("Invalid pattern '{arg}': {e}"))?
+                        .filter_map(|entry| entry.ok())
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
+                    matches.sort();
+                    if matches.is_empty() {
+                        return Err(format!("No files matched pattern: {arg}"));
+                    }
+                    file_paths.extend(matches);
+                } else {
+                    file_paths.push(arg.clone());
+                }
             }
         }
     }
