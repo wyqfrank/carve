@@ -4,16 +4,27 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use carve_core::extract::extract_candidates;
+use carve_core::jpeg::marker_dump::dump_jpeg_segments;
 use carve_core::jpeg::validate::{PatchEoiPolicy, ValidationOptions};
 use carve_core::report::write_report;
 use carve_core::scanner::{apply_validated_overlap_policy, recover_candidates, OverlapOptions};
 
-const USAGE: &str = "Usage: carve [--keep-overlaps] <file|pattern> [<file|pattern> ...]";
+const USAGE: &str = "\
+Usage:
+  carve [--keep-overlaps] <file|pattern> [<file|pattern> ...]
+  carve --dump [--json] <file>
+
+Flags:
+  --keep-overlaps   Emit all candidates without overlap suppression
+  --dump            Print JPEG segment structure instead of carving
+  --json            With --dump: output JSON instead of a text table";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliOptions {
     file_paths: Vec<String>,
     keep_overlaps: bool,
+    dump: bool,
+    json: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<CliOptions, String> {
@@ -22,11 +33,15 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     }
 
     let mut keep_overlaps = false;
+    let mut dump = false;
+    let mut json = false;
     let mut file_paths: Vec<String> = Vec::new();
 
     for arg in &args[1..] {
         match arg.as_str() {
             "--keep-overlaps" => keep_overlaps = true,
+            "--dump" => dump = true,
+            "--json" => json = true,
             _ if arg.starts_with('-') => {
                 return Err(format!("Unknown flag: {arg}\n{USAGE}"));
             }
@@ -58,6 +73,8 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     Ok(CliOptions {
         file_paths,
         keep_overlaps,
+        dump,
+        json,
     })
 }
 
@@ -79,6 +96,23 @@ fn read_inputs(paths: &[String]) -> Result<Vec<u8>, (String, std::io::Error)> {
     Ok(bytes)
 }
 
+fn run_dump(cli: &CliOptions, bytes: &[u8]) {
+    match dump_jpeg_segments(bytes, 0) {
+        Ok(dump) => {
+            if cli.json {
+                println!("{}", dump.to_json());
+            } else {
+                println!("JPEG segment dump: {}", cli.file_paths[0]);
+                print!("{}", dump.to_debug_text());
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to parse JPEG segments: {:?}", e);
+            process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let cli = match parse_args(&args) {
@@ -96,6 +130,11 @@ fn main() {
             process::exit(1);
         }
     };
+
+    if cli.dump {
+        run_dump(&cli, &bytes);
+        return;
+    }
 
     if cli.file_paths.len() == 1 {
         println!(
@@ -183,6 +222,8 @@ mod tests {
         let parsed = parse_args(&args(&["carve", "image.jpg"])).unwrap();
         assert_eq!(parsed.file_paths, vec!["image.jpg"]);
         assert!(!parsed.keep_overlaps);
+        assert!(!parsed.dump);
+        assert!(!parsed.json);
     }
 
     #[test]
@@ -197,6 +238,21 @@ mod tests {
         let parsed = parse_args(&args(&["carve", "--keep-overlaps", "a.jpg", "b.jpg"])).unwrap();
         assert_eq!(parsed.file_paths, vec!["a.jpg", "b.jpg"]);
         assert!(parsed.keep_overlaps);
+    }
+
+    #[test]
+    fn parses_dump_flag() {
+        let parsed = parse_args(&args(&["carve", "--dump", "image.jpg"])).unwrap();
+        assert!(parsed.dump);
+        assert!(!parsed.json);
+        assert_eq!(parsed.file_paths, vec!["image.jpg"]);
+    }
+
+    #[test]
+    fn parses_dump_json_flags() {
+        let parsed = parse_args(&args(&["carve", "--dump", "--json", "image.jpg"])).unwrap();
+        assert!(parsed.dump);
+        assert!(parsed.json);
     }
 
     #[test]
