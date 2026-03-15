@@ -4,6 +4,17 @@ A digital forensics tool written in Rust that recovers corrupted JPEG images fro
 
 ---
 
+## Example Recoveries
+
+Images recovered by Carve from corrupted SD card dumps:
+
+| | |
+|:---:|:---:|
+| ![IMG_1373](docs/examples/IMG_1373.jpg) | ![IMG_1403](docs/examples/IMG_1403.jpg) |
+| *IMG_1373 — recovered from fragmented sectors* | *IMG_1403 — recovered from corrupted storage* |
+
+---
+
 ## The Problem
 
 When a camera's SD card is corrupted, interrupted, or partially overwritten, the filesystem metadata is lost — but the raw image data often survives on the storage medium. Standard recovery tools find JPEGs by looking for `FF D8` (SOI) markers and copying bytes until `FF D9` (EOI). This works for simple cases but fails for:
