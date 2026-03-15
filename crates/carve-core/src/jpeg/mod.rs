@@ -5,3 +5,4 @@ pub mod candidate;
 pub mod meta;
 pub mod validate;
 pub mod marker_dump;
+pub mod restart_scan;

@@ -5,6 +5,8 @@ use std::process;
 
 use carve_core::extract::extract_candidates;
 use carve_core::jpeg::marker_dump::dump_jpeg_segments;
+use carve_core::jpeg::parse::parse_until_sos;
+use carve_core::jpeg::restart_scan::scan_restart_markers;
 use carve_core::jpeg::validate::{PatchEoiPolicy, ValidationOptions};
 use carve_core::report::write_report;
 use carve_core::scanner::{apply_validated_overlap_policy, recover_candidates, OverlapOptions};
@@ -192,6 +194,27 @@ fn main() {
                     if c.missing_soi { " (SOI synthesized)" } else { "" },
                     if c.patched_eoi { " (EOI patched)" } else { "" },
                 );
+
+                // Print restart marker summary for the candidate's entropy slice.
+                let rst_summary = if let Ok(pre_sos) = parse_until_sos(&bytes, c.start, c.end - c.start) {
+                    scan_restart_markers(&bytes, pre_sos.scan_start, c.end)
+                } else {
+                    scan_restart_markers(&bytes, c.start, c.end)
+                };
+
+                if rst_summary.count == 0 {
+                    println!("    RST markers: none");
+                } else {
+                    let regularity = if rst_summary.is_regular { "yes" } else { "no" };
+                    if let Some(mean) = rst_summary.mean_interval {
+                        println!(
+                            "    RST markers: {} (mean interval: {:.0} bytes, regular: {})",
+                            rst_summary.count, mean, regularity
+                        );
+                    } else {
+                        println!("    RST markers: {}", rst_summary.count);
+                    }
+                }
             }
         }
         Err(e) => {
