@@ -8,16 +8,19 @@ use carve_core::jpeg::marker_dump::dump_jpeg_segments;
 use carve_core::jpeg::parse::parse_until_sos;
 use carve_core::jpeg::restart_scan::scan_restart_markers;
 use carve_core::jpeg::validate::{PatchEoiPolicy, ValidationOptions};
+use carve_core::reconstruct::camera_profile::CameraJpegProfile;
+use carve_core::reconstruct::rebuilder::rebuild_candidates;
 use carve_core::report::write_report;
 use carve_core::scanner::{apply_validated_overlap_policy, recover_candidates, OverlapOptions};
 
 const USAGE: &str = "\
 Usage:
-  carve [--keep-overlaps] <file|pattern> [<file|pattern> ...]
+  carve [--keep-overlaps] [--rebuild] <file|pattern> [<file|pattern> ...]
   carve --dump [--json] <file>
 
 Flags:
   --keep-overlaps   Emit all candidates without overlap suppression
+  --rebuild         Also write camera-profile rebuilt JPEGs (rebuilt_NNN.jpg)
   --dump            Print JPEG segment structure instead of carving
   --json            With --dump: output JSON instead of a text table";
 
@@ -25,6 +28,7 @@ Flags:
 struct CliOptions {
     file_paths: Vec<String>,
     keep_overlaps: bool,
+    rebuild: bool,
     dump: bool,
     json: bool,
 }
@@ -35,6 +39,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     }
 
     let mut keep_overlaps = false;
+    let mut rebuild = false;
     let mut dump = false;
     let mut json = false;
     let mut file_paths: Vec<String> = Vec::new();
@@ -42,6 +47,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     for arg in &args[1..] {
         match arg.as_str() {
             "--keep-overlaps" => keep_overlaps = true,
+            "--rebuild" => rebuild = true,
             "--dump" => dump = true,
             "--json" => json = true,
             _ if arg.starts_with('-') => {
@@ -75,6 +81,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     Ok(CliOptions {
         file_paths,
         keep_overlaps,
+        rebuild,
         dump,
         json,
     })
@@ -223,6 +230,28 @@ fn main() {
         }
     }
 
+    if cli.rebuild {
+        let profile = CameraJpegProfile::canon_ixus_310hs();
+        match rebuild_candidates(&bytes, &candidates, &profile, &out_dir) {
+            Ok(rebuilt_paths) => {
+                let mut rebuilt_count = 0;
+                for (i, maybe_path) in rebuilt_paths.iter().enumerate() {
+                    if let Some(path) = maybe_path {
+                        println!("  [{}] rebuilt → {}", i, path.display());
+                        rebuilt_count += 1;
+                    } else {
+                        println!("  [{}] rebuild skipped (dimensions unknown)", i);
+                    }
+                }
+                println!("Rebuilt {} of {} candidate(s)", rebuilt_count, candidates.len());
+            }
+            Err(e) => {
+                eprintln!("Rebuild failed: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
     let report_path = out_dir.join("report.jsonl");
     if let Err(e) = write_report(&report_path, &candidates) {
         eprintln!("Failed to write report: {}", e);
@@ -276,6 +305,20 @@ mod tests {
         let parsed = parse_args(&args(&["carve", "--dump", "--json", "image.jpg"])).unwrap();
         assert!(parsed.dump);
         assert!(parsed.json);
+    }
+
+    #[test]
+    fn parses_rebuild_flag() {
+        let parsed = parse_args(&args(&["carve", "--rebuild", "image.jpg"])).unwrap();
+        assert!(parsed.rebuild);
+        assert!(!parsed.keep_overlaps);
+        assert_eq!(parsed.file_paths, vec!["image.jpg"]);
+    }
+
+    #[test]
+    fn rebuild_false_by_default() {
+        let parsed = parse_args(&args(&["carve", "image.jpg"])).unwrap();
+        assert!(!parsed.rebuild);
     }
 
     #[test]
