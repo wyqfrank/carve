@@ -277,11 +277,36 @@ fn main() {
         match rebuild_with_offset_search(&bytes, &candidates, &profile, &out_dir, &opts) {
             Ok(per_candidate) => {
                 let total: usize = per_candidate.iter().map(|v| v.len()).sum();
-                for (i, paths) in per_candidate.iter().enumerate() {
-                    if paths.is_empty() {
+                for (i, results) in per_candidate.iter().enumerate() {
+                    if results.is_empty() {
                         println!("  [{}] offset search skipped (dimensions unknown)", i);
-                    } else {
-                        println!("  [{}] {} offset variant(s)", i, paths.len());
+                        continue;
+                    }
+                    // Find the best-scoring result for the summary line.
+                    let best = results.iter().max_by(|a, b| {
+                        a.score.total.partial_cmp(&b.score.total).unwrap()
+                    }).unwrap();
+                    println!(
+                        "  [{}] {} offset variant(s) — best offset={} score={:.3} ({})",
+                        i,
+                        results.len(),
+                        best.offset,
+                        best.score.total,
+                        best.path.file_name().unwrap_or_default().to_string_lossy(),
+                    );
+                    // Print top-5 by score (descending).
+                    let mut ranked: Vec<_> = results.iter().collect();
+                    ranked.sort_by(|a, b| b.score.total.partial_cmp(&a.score.total).unwrap());
+                    for r in ranked.iter().take(5) {
+                        println!(
+                            "    offset={:4}  score={:.3}  entropy={:.3}  unique={:.3}  unexpected={}  {}",
+                            r.offset,
+                            r.score.total,
+                            r.score.byte_entropy,
+                            r.score.unique_byte_ratio,
+                            r.score.unexpected_markers,
+                            r.path.file_name().unwrap_or_default().to_string_lossy(),
+                        );
                     }
                 }
                 println!("Offset search: {} file(s) written", total);
