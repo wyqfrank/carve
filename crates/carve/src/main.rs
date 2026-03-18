@@ -9,26 +9,30 @@ use carve_core::jpeg::parse::parse_until_sos;
 use carve_core::jpeg::restart_scan::scan_restart_markers;
 use carve_core::jpeg::validate::{PatchEoiPolicy, ValidationOptions};
 use carve_core::reconstruct::camera_profile::CameraJpegProfile;
-use carve_core::reconstruct::rebuilder::rebuild_candidates;
+use carve_core::reconstruct::rebuilder::{rebuild_candidates, rebuild_with_offset_search, OffsetSearchOptions};
 use carve_core::report::write_report;
 use carve_core::scanner::{apply_validated_overlap_policy, recover_candidates, OverlapOptions};
 
 const USAGE: &str = "\
 Usage:
-  carve [--keep-overlaps] [--rebuild] <file|pattern> [<file|pattern> ...]
+  carve [--keep-overlaps] [--rebuild] [--offset-search] [--offset-max N] <file|pattern> ...
   carve --dump [--json] <file>
 
 Flags:
-  --keep-overlaps   Emit all candidates without overlap suppression
-  --rebuild         Also write camera-profile rebuilt JPEGs (rebuilt_NNN.jpg)
-  --dump            Print JPEG segment structure instead of carving
-  --json            With --dump: output JSON instead of a text table";
+  --keep-overlaps      Emit all candidates without overlap suppression
+  --rebuild            Also write camera-profile rebuilt JPEGs (rebuilt_NNN.jpg)
+  --offset-search      For each candidate try multiple entropy offsets (rebuilt_NNN_offset_MMMM.jpg)
+  --offset-max N       Maximum byte offset to try with --offset-search (default: 512)
+  --dump               Print JPEG segment structure instead of carving
+  --json               With --dump: output JSON instead of a text table";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliOptions {
     file_paths: Vec<String>,
     keep_overlaps: bool,
     rebuild: bool,
+    offset_search: bool,
+    offset_max: usize,
     dump: bool,
     json: bool,
 }
@@ -40,17 +44,30 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
 
     let mut keep_overlaps = false;
     let mut rebuild = false;
+    let mut offset_search = false;
+    let mut offset_max: usize = OffsetSearchOptions::default().max_offset;
     let mut dump = false;
     let mut json = false;
     let mut file_paths: Vec<String> = Vec::new();
+    let mut args_iter = args[1..].iter().peekable();
 
-    for arg in &args[1..] {
+    while let Some(arg) = args_iter.next() {
         match arg.as_str() {
             "--keep-overlaps" => keep_overlaps = true,
             "--rebuild" => rebuild = true,
+            "--offset-search" => offset_search = true,
+            "--offset-max" => {
+                let val = args_iter.next().ok_or_else(|| {
+                    format!("--offset-max requires a value\n{USAGE}")
+                })?;
+                offset_max = val.parse::<usize>().map_err(|_| {
+                    format!("--offset-max value must be a non-negative integer, got '{val}'\n{USAGE}")
+                })?;
+                offset_search = true; // --offset-max implies --offset-search
+            }
             "--dump" => dump = true,
             "--json" => json = true,
-            _ if arg.starts_with('-') => {
+            arg if arg.starts_with('-') => {
                 return Err(format!("Unknown flag: {arg}\n{USAGE}"));
             }
             _ => {
@@ -82,6 +99,8 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
         file_paths,
         keep_overlaps,
         rebuild,
+        offset_search,
+        offset_max,
         dump,
         json,
     })
@@ -252,6 +271,28 @@ fn main() {
         }
     }
 
+    if cli.offset_search {
+        let profile = CameraJpegProfile::canon_ixus_310hs();
+        let opts = OffsetSearchOptions { max_offset: cli.offset_max, step: 1 };
+        match rebuild_with_offset_search(&bytes, &candidates, &profile, &out_dir, &opts) {
+            Ok(per_candidate) => {
+                let total: usize = per_candidate.iter().map(|v| v.len()).sum();
+                for (i, paths) in per_candidate.iter().enumerate() {
+                    if paths.is_empty() {
+                        println!("  [{}] offset search skipped (dimensions unknown)", i);
+                    } else {
+                        println!("  [{}] {} offset variant(s)", i, paths.len());
+                    }
+                }
+                println!("Offset search: {} file(s) written", total);
+            }
+            Err(e) => {
+                eprintln!("Offset search failed: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
     let report_path = out_dir.join("report.jsonl");
     if let Err(e) = write_report(&report_path, &candidates) {
         eprintln!("Failed to write report: {}", e);
@@ -319,6 +360,46 @@ mod tests {
     fn rebuild_false_by_default() {
         let parsed = parse_args(&args(&["carve", "image.jpg"])).unwrap();
         assert!(!parsed.rebuild);
+    }
+
+    #[test]
+    fn parses_offset_search_flag() {
+        let parsed = parse_args(&args(&["carve", "--offset-search", "image.jpg"])).unwrap();
+        assert!(parsed.offset_search);
+        assert_eq!(parsed.offset_max, 512);
+    }
+
+    #[test]
+    fn parses_offset_max_flag() {
+        let parsed = parse_args(&args(&["carve", "--offset-max", "256", "image.jpg"])).unwrap();
+        assert!(parsed.offset_search);
+        assert_eq!(parsed.offset_max, 256);
+    }
+
+    #[test]
+    fn offset_max_implies_offset_search() {
+        let parsed = parse_args(&args(&["carve", "--offset-max", "100", "image.jpg"])).unwrap();
+        assert!(parsed.offset_search);
+    }
+
+    #[test]
+    fn offset_search_false_by_default() {
+        let parsed = parse_args(&args(&["carve", "image.jpg"])).unwrap();
+        assert!(!parsed.offset_search);
+        assert_eq!(parsed.offset_max, 512);
+    }
+
+    #[test]
+    fn rejects_offset_max_without_value() {
+        let err = parse_args(&args(&["carve", "--offset-max", "image.jpg"])).unwrap_err();
+        // "image.jpg" is not a valid usize, so should get a parse error
+        assert!(err.contains("integer") || err.contains("offset-max"));
+    }
+
+    #[test]
+    fn rejects_offset_max_non_integer() {
+        let err = parse_args(&args(&["carve", "--offset-max", "abc", "image.jpg"])).unwrap_err();
+        assert!(err.contains("integer"));
     }
 
     #[test]
