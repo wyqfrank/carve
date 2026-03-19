@@ -1,249 +1,230 @@
 # Carve
 
-A digital forensics tool written in Rust that recovers corrupted JPEG images from raw byte streams. Unlike generic file carvers that rely solely on header detection, Carve performs entropy-aware JPEG scanning and camera-specific header reconstruction to improve recovery quality.
+Carve is a Rust digital forensics tool for recovering damaged JPEGs from raw byte streams such as SD card dumps, sector captures, or partially recovered binary blobs.
 
----
+Traditional file carvers look for `FF D8` and copy bytes until `FF D9`. That works for simple cases, but it breaks down when the JPEG header is damaged, the entropy stream is truncated, or the carve begins at the wrong alignment. Carve goes further: it parses JPEG structure, scans entropy-coded data safely, and then attempts camera-aware reconstruction for Canon IXUS 310 HS images.
 
-## Example Recoveries
+The project has two distinct recovery phases:
 
-Images recovered by Carve from corrupted SD card dumps:
+- Phase 1: entropy-aware JPEG carving from raw bytes
+- Phase 2: camera-aware reconstruction using a Canon IXUS 310 HS profile plus entropy offset search
 
-| | |
-|:---:|:---:|
-| ![IMG_1373](docs/examples/IMG_1373.jpg) | ![IMG_1403](docs/examples/IMG_1403.jpg) |
-| *IMG_1373 — recovered from fragmented sectors* | *IMG_1403 — recovered from corrupted storage* |
+## Example Results
 
----
+The checked-in examples below are recovered outputs produced by the pipeline:
 
-## The Problem
-
-When a camera's SD card is corrupted, interrupted, or partially overwritten, the filesystem metadata is lost — but the raw image data often survives on the storage medium. Standard recovery tools find JPEGs by looking for `FF D8` (SOI) markers and copying bytes until `FF D9` (EOI). This works for simple cases but fails for:
-
-- **Truncated files** — the EOI marker was never written
-- **Colour-shifted images** — the carved entropy stream was paired with the wrong header, breaking the quantisation and Huffman tables
-- **Block-shifted images** — carving started mid-MCU, causing the decoder to misalign its 8×8 pixel blocks
-- **Entropy corruption** — byte stuffing violations or unexpected markers mid-stream
-
-Carve addresses each of these specifically.
-
----
-
-## How JPEG Recovery Works
-
-A JPEG file has two distinct regions:
-
-```
-SOI → APP segments → DQT → SOF → DHT → SOS → [entropy stream] → EOI
+```text
+Raw carve
+    ->
+Camera-aware reconstruction
+    ->
+Recovered image
 ```
 
-- **Header** (SOI through SOS): structured, parseable, contains compression parameters
-- **Entropy stream**: raw DCT-coded pixel data, mostly opaque binary
+| Result | Notes |
+|--------|-------|
+| ![Recovered IMG_1373](docs/examples/IMG_1373.jpg) | `IMG_1373` recovered from fragmented/truncated storage data |
+| ![Recovered IMG_1403](docs/examples/IMG_1403.jpg) | `IMG_1403` recovered from corrupted storage data |
 
-The header defines the quantisation tables (DQT) and Huffman tables (DHT) used to decode the entropy stream. If a carved image uses the wrong tables — even slightly — the result is severe colour distortion or a decode failure.
+When you run the CLI with `--rebuild` or `--offset-search`, Carve writes both the raw carved candidate and the rebuilt variants so they can be compared side by side.
 
-Additionally, the entropy stream uses **byte stuffing**: any `FF` byte in the stream is followed by `00` to distinguish it from a real marker. Restart markers (`RST0`–`RST7`) appear at regular intervals to allow partial recovery from corruption. A carver must handle both correctly to measure the true extent of a JPEG.
+## Why JPEG Recovery Is Hard
 
----
+JPEGs have a structured header followed by an entropy-coded scan:
+
+```text
+SOI -> APP segments -> DQT -> SOF -> DHT -> SOS -> Entropy stream -> EOI
+```
+
+The header is parseable. The entropy stream is not; it is compressed bitstream data with JPEG-specific rules:
+
+- `FF 00` is byte stuffing, not a marker
+- `RST0` to `RST7` may appear inside the entropy stream
+- a missing `EOI` may mean the image is truncated, not absent
+- the wrong quantisation or Huffman tables can decode into severe color/block artifacts even if the entropy bytes are intact
+
+That means a serious JPEG carver has to do more than copy bytes between two markers.
 
 ## Recovery Pipeline
 
+```text
+Disk image / raw byte stream
+        |
+        v
+JPEG marker detection
+Find candidate SOI offsets
+        |
+        v
+Pre-SOS header parsing
+Validate marker order and extract dimensions/metadata
+        |
+        v
+Entropy stream scanning
+Walk compressed bytes while respecting FF 00 and restart markers
+        |
+        v
+Candidate validation
+Classify complete vs truncated, optionally patch missing EOI
+        |
+        v
+Candidate ranking + overlap suppression
+Keep the strongest candidate for each overlapping region
+        |
+        v
+Phase 1 output
+Write recovered_NNN.jpg + report.jsonl
+        |
+        v
+Phase 2 rebuild (optional)
+Apply Canon IXUS 310 HS profile and try entropy offsets
+        |
+        v
+Recovered JPEG variants
+Write rebuilt_NNN.jpg / rebuilt_NNN_offset_MMMM.jpg
 ```
-Raw byte stream (disk image, memory dump, concatenated sectors)
-        |
-        v
-  JPEG Marker Detection
-  Scan for FF D8 (SOI) candidates
-        |
-        v
-  Pre-SOS Header Parsing
-  Validate: SOI -> APP* -> DQT -> SOF -> DHT -> SOS
-  Extract: dimensions, Exif, quantisation flags, Huffman flags
-        |
-        v
-  Entropy Stream Scanning
-  Walk entropy bytes respecting byte stuffing (FF 00)
-  and restart markers (RST0-RST7)
-  Terminate at: EOI, unexpected marker, or size bound
-        |
-        v
-  Candidate Validation
-  Apply truncation policy (allow_truncated)
-  Apply EOI patching policy (append FF D9 if missing)
-  Compute deterministic confidence score (0.0-1.0)
-        |
-        v
-  Overlap Suppression
-  Cluster overlapping byte ranges
-  Emit the strongest candidate per cluster
-  (complete > truncated > larger span > earlier start)
-        |
-        v
-  Extraction + Report
-  Write recovered JPEGs to recovered/<stem>/
-  Write JSONL report with metadata per candidate
-```
 
----
+## Phase 1 vs Phase 2
 
-## Camera-Specific Reconstruction (Phase 2)
+Phase 1 is the generic recovery path:
 
-Generic carving preserves whatever header was found in the byte stream. For Canon IXUS 310 HS images, analysis of 19 clean reference images revealed that the following fields are **invariant across every image produced by this camera**:
+- scan for JPEG candidates
+- parse up to `SOS`
+- scan the entropy stream safely
+- validate and score candidates
+- extract the best byte ranges as recovered JPEGs
 
-- Quantisation tables (DQT) — identical 130-byte payload in all reference images
-- Huffman tables (DHT) — identical 416-byte payload in all reference images
-- SOF0 structure — precision=8, chroma subsampling 4:2:0 (Y: 2H×1V, Cb/Cr: 1H×1V)
-- SOS scan header — 10-byte payload, always the same
-- No DRI segment — this camera never emits a restart interval
+Phase 2 is camera-aware and currently focused on Canon IXUS 310 HS:
 
-Only **width and height** differ per image.
+- rebuild a clean JPEG header from the camera profile
+- inject recovered width and height into `SOF0`
+- reuse camera-specific table/header fields where available
+- try small offsets into the entropy stream to correct MCU alignment issues
+- rank rebuilt variants to help pick the best output
 
-This means a recovered entropy stream can be paired with a freshly assembled camera-correct header, regardless of whether the original header survived. The result is structurally identical to what the camera would have written.
+This is the difference between "I found JPEG-looking bytes" and "I rebuilt something close to what the camera firmware intended to write."
 
-Phase 2 implements:
+## Camera-Specific Recovery
 
-1. **Header builder** — assembles `SOI → DQT → SOF0 → DHT → SOS` from the camera profile with injected dimensions
-2. **JPEG rebuilder** — combines a carved entropy stream with a camera-correct header and EOI
-3. **Entropy offset search** — tests small byte offsets into the entropy stream to correct MCU alignment
-4. **Candidate scoring** — ranks multiple reconstruction attempts automatically
+Analysis of the Canon IXUS 310 HS reference set showed that the camera emits a highly stable baseline JPEG structure:
 
----
+- marker order is stable: `SOI -> APP1 -> DQT -> SOF0 -> DHT -> SOS`
+- quantisation tables are invariant across the analyzed images
+- Huffman tables are treated as camera-specific reusable data in the reconstruction model
+- the `SOF0` template is stable except for width and height
+- no `DRI` segment was observed for this camera
+
+That makes reconstruction practical:
+
+- `DQT` can be reproduced from the Canon profile
+- `SOF0` can be rebuilt with recovered dimensions
+- `SOS` can be reproduced from the Canon profile
+- `DHT` payloads can be attached from reference extraction when building a full camera-specific header
+
+Why this matters: if the entropy stream is mostly intact but the original on-disk header is wrong or partially overwritten, a rebuilt camera-correct header is often the difference between a broken decode and a usable image.
+
+For the detailed analysis behind the profile, see [docs/canon_ixus_310hs_profile_analysis.md](/mnt/c/Users/frank/projects/carve/docs/canon_ixus_310hs_profile_analysis.md).
 
 ## Architecture
 
-```
+```text
 crates/
-  carve-core/          Library crate — all parsing, scanning, and recovery logic
+  carve-core/
     src/
       jpeg/
-        markers.rs     JPEG marker constants and helpers
-        parse.rs       Pre-SOS header parser (parse_until_sos)
-        entropy.rs     Entropy stream scanner (scan_entropy_stream)
-        validate.rs    Candidate validation and confidence scoring
-        meta.rs        SOF metadata extraction
-        marker_dump.rs Segment dump utility for camera profile analysis
-        restart_scan.rs Restart marker detection and statistics
+        markers.rs        JPEG marker constants/helpers
+        parse.rs          pre-SOS parser and header validation
+        entropy.rs        entropy stream scanner
+        validate.rs       candidate validation and confidence scoring
+        meta.rs           SOF metadata extraction
+        restart_scan.rs   restart marker analysis
+        marker_dump.rs    JPEG segment dump utility
       reconstruct/
-        camera_profile.rs  CameraJpegProfile — invariant camera header fields
-        header_builder.rs  Build JPEG header bytes from a profile + dimensions
-      scanner.rs       Top-level recovery orchestration and overlap suppression
-      extract.rs       Write candidate bytes to output files
-      report.rs        JSONL report serialisation
-  carve/               Binary crate — CLI wrapper
+        camera_profile.rs Canon-specific header profile model
+        header_builder.rs synthetic JPEG header builder
+        rebuilder.rs      phase 2 JPEG rebuild + offset search
+        scorer.rs         entropy-based ranking for rebuilt outputs
+      scanner.rs          end-to-end candidate recovery orchestration
+      extract.rs          recovered file writer
+      report.rs           JSONL report writer
+      fragmented.rs       fragmented recovery helpers
+  carve/
     src/
-      main.rs          Argument parsing, file I/O, pipeline wiring
+      main.rs            CLI entry point and pipeline wiring
 ```
 
-**Key types:**
+At a high level:
 
-| Type | Description |
-|------|-------------|
-| `PreSosResult` | Parsed header: scan start offset, metadata flags |
-| `EntropyResult` | Scanned entropy: end offset, termination reason |
-| `Candidate` | Raw byte range from scanning: start, end, status |
-| `ValidatedCandidate` | Enriched: confidence score, metadata flags, patch state |
-| `CameraJpegProfile` | Invariant camera header fields, dimension-free |
-| `JsonlRecord` | Serialisable output record |
+- `jpeg/` handles low-level JPEG structure and entropy-safe scanning
+- `scanner.rs` turns those primitives into ranked recovery candidates
+- `reconstruct/` handles camera-aware rebuilding for Phase 2
+- `extract.rs` and `report.rs` turn results into files the user can inspect
 
----
+## Running the Tool
 
-## Usage
-
-```bash
-# Carve all JPEG candidates from a raw image or binary file
-carve <file>
-
-# Carve multiple files / sectors concatenated
-carve sector_001.bin sector_002.bin sector_003.bin
-
-# Glob expansion
-carve "sectors/*.bin"
-
-# Keep all overlapping candidates (skip suppression)
-carve --keep-overlaps <file>
-
-# Inspect the JPEG segment structure of a file
-carve --dump <file>
-carve --dump --json <file>
-```
-
-Output is written to `recovered/<input-stem>/`:
-
-```
-recovered/
-  image/
-    candidate_0000.jpg     Recovered JPEG (confidence: 0.95)
-    candidate_0001.jpg     Recovered JPEG (confidence: 0.72, EOI patched)
-    report.jsonl           Metadata for each candidate
-```
-
-Each `report.jsonl` line contains:
-
-```json
-{
-  "start": 0,
-  "end": 142857,
-  "status": "Recovered",
-  "confidence_score": 0.95,
-  "missing_soi": false,
-  "patched_eoi": false,
-  "jpeg_meta": {
-    "has_exif": true,
-    "has_sof": true,
-    "width": 3264,
-    "height": 2448
-  },
-  "corruption": {
-    "unexpected_marker": false,
-    "truncated": false
-  }
-}
-```
-
----
-
-## Confidence Score
-
-Each candidate receives a deterministic score from 0.0 to 1.0:
-
-| Signal | Weight |
-|--------|--------|
-| SOI marker present | +0.15 |
-| SOS marker present | +0.25 |
-| Exif data present | +0.20 |
-| SOF frame header present | +0.20 |
-| EOI marker present | +0.20 |
-
-A complete, well-formed JPEG with all five signals scores 1.0. Truncated candidates with EOI patched score lower.
-
----
-
-## Current Limitations
-
-- **Camera profile:** Canon IXUS 310 HS only (Phase 2). Other cameras use Phase 1 raw carving.
-- **Fragmented images:** sectors are concatenated as input; true fragment reassembly is not yet implemented.
-- **Unknown dimensions:** if SOF is missing and the image cannot be decoded, dimensions default to 0×0.
-- **Extreme entropy corruption:** overwritten or physically damaged sectors cannot be recovered.
-- **Progressive JPEGs:** detected and reported but not reconstructed by Phase 2.
-
----
-
-## Future Work
-
-- Restart-marker resynchronisation for mid-stream corruption recovery
-- Multi-camera profile support
-- Entropy-based MCU alignment scoring
-- Fragment reassembly across non-contiguous sectors
-- AI-based perceptual restoration for irrecoverable regions
-- Progressive JPEG reconstruction
-
----
-
-## Building
+Build and test:
 
 ```bash
 cargo build --release
 cargo test
-cargo clippy
 ```
 
-Requires Rust stable (tested on 1.x).
+Recover JPEGs from one or more raw inputs:
+
+```bash
+carve image.bin
+carve sector_001.bin sector_002.bin sector_003.bin
+carve "sectors/*.bin"
+```
+
+Keep all overlapping candidates:
+
+```bash
+carve --keep-overlaps image.bin
+```
+
+Run Phase 2 Canon-aware rebuilding:
+
+```bash
+carve --rebuild image.bin
+carve --offset-search --offset-max 512 image.bin
+```
+
+Inspect JPEG structure instead of carving:
+
+```bash
+carve --dump image.jpg
+carve --dump --json image.jpg
+```
+
+Typical output layout:
+
+```text
+recovered/
+  image/
+    recovered_000.jpg
+    rebuilt_000.jpg
+    rebuilt_000_offset_0000.jpg
+    rebuilt_000_offset_0001.jpg
+    report.jsonl
+```
+
+`report.jsonl` records offsets, status, dimensions, confidence, and corruption flags for each candidate.
+
+## Limitations
+
+- Partial entropy corruption can still make the recovered image decode badly or fail entirely.
+- Overwritten data cannot be reconstructed if the original compressed bytes are gone.
+- If dimensions cannot be recovered, Phase 2 rebuild output may be skipped.
+- Extreme fragmentation is still a hard case; the current pipeline does not fully reassemble arbitrary multi-fragment JPEGs.
+- Progressive JPEGs are not the focus of the current reconstruction path.
+- Canon IXUS 310 HS is the documented camera-specific profile today; generic carving works more broadly than camera-aware rebuilding.
+
+## Future Work
+
+- restart-marker resynchronisation for damaged streams
+- multi-camera profile support
+- better entropy alignment heuristics
+- stronger fragment reassembly across non-contiguous clusters
+- progressive JPEG recovery
+- decoder-backed or perceptual scoring instead of entropy-only ranking
+- AI-assisted artifact repair after structural recovery
