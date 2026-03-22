@@ -1,4 +1,6 @@
 use crate::jpeg::parse::parse_until_sos;
+use crate::reconstruct::decode::DecodeResult;
+use crate::reconstruct::image_metrics::{compute_image_metrics, ImageMetrics};
 
 /// Quality score for a reconstructed JPEG candidate.
 ///
@@ -31,6 +33,49 @@ pub struct JpegScore {
 
     /// Combined quality score 0.0–1.0 (higher = more likely a good recovery).
     pub total: f32,
+}
+
+/// Weighted decode-aware score derived from decoded pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodeAwareScore {
+    pub decode_success_score: f32,
+    pub colour_balance: f32,
+    pub pixel_entropy: f32,
+    pub block_artifact_score: f32,
+    pub total: f32,
+}
+
+/// Combine decode-based image metrics into a single weighted score.
+///
+/// Formula:
+/// `0.4 * decode_success + 0.2 * colour_balance + 0.2 * pixel_entropy + 0.2 * block_artifact_score`
+pub fn score_image(decoded: DecodeResult) -> f32 {
+    score_decoded_image(&decoded).total
+}
+
+/// Compute the full decode-aware scoring breakdown for a decoded image.
+pub fn score_decoded_image(decoded: &DecodeResult) -> DecodeAwareScore {
+    let metrics = compute_image_metrics(decoded);
+    score_image_metrics(&metrics)
+}
+
+/// Compute the full decode-aware scoring breakdown from precomputed metrics.
+pub fn score_image_metrics(metrics: &ImageMetrics) -> DecodeAwareScore {
+    let total = (
+        0.4 * metrics.decode_success_score
+            + 0.2 * metrics.colour_balance
+            + 0.2 * metrics.pixel_entropy
+            + 0.2 * metrics.block_artifact_score
+    )
+    .clamp(0.0, 1.0);
+
+    DecodeAwareScore {
+        decode_success_score: metrics.decode_success_score,
+        colour_balance: metrics.colour_balance,
+        pixel_entropy: metrics.pixel_entropy,
+        block_artifact_score: metrics.block_artifact_score,
+        total,
+    }
 }
 
 /// Score a raw entropy-coded stream slice.
@@ -122,6 +167,7 @@ fn count_unexpected_markers(data: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reconstruct::decode::decode_jpeg;
 
     fn uniform_data(byte: u8, len: usize) -> Vec<u8> {
         vec![byte; len]
@@ -129,6 +175,11 @@ mod tests {
 
     fn all_bytes_data() -> Vec<u8> {
         (0u8..=255).collect()
+    }
+
+    fn example_jpeg_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/examples/IMG_1373.jpg")
     }
 
     // ---- byte entropy ----
@@ -282,5 +333,48 @@ mod tests {
         let direct = score_entropy_stream(&entropy);
         assert!((score.total - direct.total).abs() < 0.01,
             "score_rebuilt_jpeg should strip EOI before scoring");
+    }
+
+    // ---- decode-aware scoring ----
+
+    #[test]
+    fn decode_aware_score_is_zero_for_failed_decode() {
+        let score = score_image(DecodeResult::default());
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn decode_aware_score_is_clamped_to_0_1() {
+        let metrics = ImageMetrics {
+            decode_success_score: 1.0,
+            colour_balance: 1.0,
+            pixel_entropy: 1.0,
+            block_artifact_score: 1.0,
+        };
+
+        let score = score_image_metrics(&metrics);
+        assert_eq!(score.total, 1.0);
+    }
+
+    #[test]
+    fn decode_aware_score_matches_weighted_formula() {
+        let metrics = ImageMetrics {
+            decode_success_score: 1.0,
+            colour_balance: 0.5,
+            pixel_entropy: 0.25,
+            block_artifact_score: 0.75,
+        };
+
+        let score = score_image_metrics(&metrics);
+        let expected = 0.4 + 0.1 + 0.05 + 0.15;
+        assert!((score.total - expected).abs() < 0.0001);
+    }
+
+    #[test]
+    fn decoded_fixture_scores_higher_than_failed_decode() {
+        let bytes = std::fs::read(example_jpeg_path()).unwrap();
+        let decoded = decode_jpeg(&bytes);
+
+        assert!(score_image(decoded) > score_image(DecodeResult::default()));
     }
 }
