@@ -5,7 +5,7 @@ use crate::jpeg::parse::{parse_until_sos, parse_until_sos_no_soi};
 use crate::jpeg::validate::ValidatedCandidate;
 use super::camera_profile::CameraJpegProfile;
 use super::header_builder::build_header;
-use super::scorer::{score_entropy_stream, JpegScore};
+use super::scorer::{score_rebuilt_candidate, DecodeAwareScore, JpegScore};
 
 const EOI_MARKER: [u8; 2] = [0xFF, 0xD9];
 
@@ -34,11 +34,13 @@ pub struct OffsetSearchOptions {
     pub max_offset: usize,
     /// Step size between successive offsets.  Default: 1.
     pub step: usize,
+    /// Enable decode-aware scoring with entropy fallback. Default: false.
+    pub decode_score: bool,
 }
 
 impl Default for OffsetSearchOptions {
     fn default() -> Self {
-        Self { max_offset: 512, step: 1 }
+        Self { max_offset: 512, step: 1, decode_score: false }
     }
 }
 
@@ -49,8 +51,14 @@ pub struct OffsetSearchResult {
     pub path: PathBuf,
     /// Byte offset into the entropy stream that was used.
     pub offset: usize,
-    /// Quality score computed from the entropy stream at this offset.
+    /// Entropy-only score for this offset.
     pub score: JpegScore,
+    /// Decode-aware score when enabled and decoding succeeded.
+    pub decode_score: Option<DecodeAwareScore>,
+    /// Final ranking score used by the pipeline.
+    pub final_score: f32,
+    /// Whether the final score came from decode-aware scoring.
+    pub used_decode_score: bool,
 }
 
 /// Locate the entropy stream bounds for a candidate.
@@ -154,6 +162,7 @@ pub fn rebuild_with_offset_search(
     options: &OffsetSearchOptions,
 ) -> Result<Vec<Vec<OffsetSearchResult>>, RebuildError> {
     let step = options.step.max(1);
+    let use_decode_score = options.decode_score;
     let mut result = Vec::with_capacity(candidates.len());
 
     for (i, candidate) in candidates.iter().enumerate() {
@@ -178,12 +187,20 @@ pub fn rebuild_with_offset_search(
             }
 
             let entropy = &bytes[entropy_start..entropy_end];
-            let score = score_entropy_stream(entropy);
+            let rebuilt = build_jpeg_bytes(&header, entropy);
+            let ranked = score_rebuilt_candidate(&rebuilt, entropy, use_decode_score);
 
             let filename = format!("rebuilt_{:03}_offset_{:04}.jpg", i, offset);
             let path = output_dir.join(&filename);
-            write_jpeg(&path, &header, entropy)?;
-            results.push(OffsetSearchResult { path, offset, score });
+            write_jpeg_bytes(&path, &rebuilt)?;
+            results.push(OffsetSearchResult {
+                path,
+                offset,
+                score: ranked.entropy_score,
+                decode_score: ranked.decode_score,
+                final_score: ranked.total,
+                used_decode_score: ranked.used_decode_score,
+            });
 
             if offset >= options.max_offset {
                 break;
@@ -199,11 +216,22 @@ pub fn rebuild_with_offset_search(
 
 /// Write a single rebuilt JPEG: `header + entropy + EOI`.
 fn write_jpeg(path: &Path, header: &[u8], entropy: &[u8]) -> Result<(), RebuildError> {
+    let rebuilt = build_jpeg_bytes(header, entropy);
+    write_jpeg_bytes(path, &rebuilt)
+}
+
+fn build_jpeg_bytes(header: &[u8], entropy: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(header.len() + entropy.len() + EOI_MARKER.len());
+    bytes.extend_from_slice(header);
+    bytes.extend_from_slice(entropy);
+    bytes.extend_from_slice(&EOI_MARKER);
+    bytes
+}
+
+fn write_jpeg_bytes(path: &Path, bytes: &[u8]) -> Result<(), RebuildError> {
     let file = std::fs::File::create(path)?;
     let mut writer = io::BufWriter::new(file);
-    writer.write_all(header)?;
-    writer.write_all(entropy)?;
-    writer.write_all(&EOI_MARKER)?;
+    writer.write_all(bytes)?;
     writer.flush()?;
     Ok(())
 }
@@ -417,7 +445,7 @@ mod tests {
         let end = jpeg.len();
         let candidate = make_candidate(0, end, false, false, Some(320), Some(240));
         let dir = temp_subdir("offset_zero");
-        let opts = OffsetSearchOptions { max_offset: 0, step: 1 };
+        let opts = OffsetSearchOptions { max_offset: 0, step: 1, decode_score: false };
         let result = rebuild_with_offset_search(&jpeg, &[candidate], &profile(), &dir, &opts).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1, "max_offset=0 should produce exactly one file (offset 0)");
@@ -432,7 +460,7 @@ mod tests {
         let end = jpeg.len();
         let candidate = make_candidate(0, end, false, false, Some(320), Some(240));
         let dir = temp_subdir("offset_names");
-        let opts = OffsetSearchOptions { max_offset: 2, step: 1 };
+        let opts = OffsetSearchOptions { max_offset: 2, step: 1, decode_score: false };
         let result = rebuild_with_offset_search(&jpeg, &[candidate], &profile(), &dir, &opts).unwrap();
         assert_eq!(result[0].len(), 3);
         assert_eq!(result[0][0].path.file_name().unwrap(), "rebuilt_000_offset_0000.jpg");
@@ -447,7 +475,7 @@ mod tests {
         let end = jpeg.len();
         let candidate = make_candidate(0, end, false, false, Some(320), Some(240));
         let dir = temp_subdir("offset_soi_eoi");
-        let opts = OffsetSearchOptions { max_offset: 2, step: 1 };
+        let opts = OffsetSearchOptions { max_offset: 2, step: 1, decode_score: false };
         let result = rebuild_with_offset_search(&jpeg, &[candidate], &profile(), &dir, &opts).unwrap();
         for r in &result[0] {
             let out = std::fs::read(&r.path).unwrap();
@@ -463,7 +491,7 @@ mod tests {
         let end = jpeg.len();
         let candidate = make_candidate(0, end, false, false, Some(320), Some(240));
         let dir = temp_subdir("offset_shorter");
-        let opts = OffsetSearchOptions { max_offset: 2, step: 1 };
+        let opts = OffsetSearchOptions { max_offset: 2, step: 1, decode_score: false };
         let result = rebuild_with_offset_search(&jpeg, &[candidate], &profile(), &dir, &opts).unwrap();
         let len0 = std::fs::read(&result[0][0].path).unwrap().len();
         let len2 = std::fs::read(&result[0][2].path).unwrap().len();
@@ -477,7 +505,7 @@ mod tests {
         let end = jpeg.len();
         let candidate = make_candidate(0, end, false, false, Some(320), Some(240));
         let dir = temp_subdir("offset_exhaust");
-        let opts = OffsetSearchOptions { max_offset: 10, step: 1 };
+        let opts = OffsetSearchOptions { max_offset: 10, step: 1, decode_score: false };
         let result = rebuild_with_offset_search(&jpeg, &[candidate], &profile(), &dir, &opts).unwrap();
         // entropy has 5 bytes; valid offsets are 0..=4
         assert_eq!(result[0].len(), 5, "should stop at offset 4 (last byte)");
@@ -490,7 +518,7 @@ mod tests {
         let end = jpeg.len();
         let candidate = make_candidate(0, end, false, false, Some(320), Some(240));
         let dir = temp_subdir("offset_step");
-        let opts = OffsetSearchOptions { max_offset: 4, step: 2 };
+        let opts = OffsetSearchOptions { max_offset: 4, step: 2, decode_score: false };
         let result = rebuild_with_offset_search(&jpeg, &[candidate], &profile(), &dir, &opts).unwrap();
         // offsets tried: 0, 2, 4
         assert_eq!(result[0].len(), 3);
@@ -528,6 +556,7 @@ mod tests {
         let opts = OffsetSearchOptions::default();
         assert_eq!(opts.max_offset, 512);
         assert_eq!(opts.step, 1);
+        assert!(!opts.decode_score);
     }
 
     #[test]
@@ -543,7 +572,7 @@ mod tests {
             make_candidate(off1, off1 + jpeg1.len(), false, false, Some(640), Some(480)),
         ];
         let dir = temp_subdir("offset_multi");
-        let opts = OffsetSearchOptions { max_offset: 0, step: 1 };
+        let opts = OffsetSearchOptions { max_offset: 0, step: 1, decode_score: false };
         let result = rebuild_with_offset_search(&bytes, &candidates, &profile(), &dir, &opts).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].len(), 1);
@@ -561,10 +590,11 @@ mod tests {
         let end = jpeg.len();
         let candidate = make_candidate(0, end, false, false, Some(320), Some(240));
         let dir = temp_subdir("offset_score");
-        let opts = OffsetSearchOptions { max_offset: 0, step: 1 };
+        let opts = OffsetSearchOptions { max_offset: 0, step: 1, decode_score: false };
         let result = rebuild_with_offset_search(&jpeg, &[candidate], &profile(), &dir, &opts).unwrap();
         let score = result[0][0].score;
         assert!((0.0..=1.0).contains(&score.total), "score must be in [0, 1]");
+        assert!((0.0..=1.0).contains(&result[0][0].final_score), "final_score must be in [0, 1]");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -589,7 +619,7 @@ mod tests {
         let candidate = make_candidate(0, end, false, false, Some(320), Some(240));
         let dir = temp_subdir("offset_score_rank");
         // Try offsets 0 and 250 — at offset 250 only 6 bytes remain, very low entropy.
-        let opts = OffsetSearchOptions { max_offset: 250, step: 250 };
+        let opts = OffsetSearchOptions { max_offset: 250, step: 250, decode_score: false };
         let result = rebuild_with_offset_search(&jpeg, &[candidate], &profile(), &dir, &opts).unwrap();
 
         assert_eq!(result[0].len(), 2, "should have offset 0 and offset 250");

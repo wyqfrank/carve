@@ -15,13 +15,14 @@ use carve_core::scanner::{apply_validated_overlap_policy, recover_candidates, Ov
 
 const USAGE: &str = "\
 Usage:
-  carve [--keep-overlaps] [--rebuild] [--offset-search] [--offset-max N] <file|pattern> ...
+  carve [--keep-overlaps] [--rebuild] [--offset-search] [--decode-score] [--offset-max N] <file|pattern> ...
   carve --dump [--json] <file>
 
 Flags:
   --keep-overlaps      Emit all candidates without overlap suppression
   --rebuild            Also write camera-profile rebuilt JPEGs (rebuilt_NNN.jpg)
   --offset-search      For each candidate try multiple entropy offsets (rebuilt_NNN_offset_MMMM.jpg)
+  --decode-score       Use decode-aware scoring for offset ranking with entropy fallback
   --offset-max N       Maximum byte offset to try with --offset-search (default: 512)
   --dump               Print JPEG segment structure instead of carving
   --json               With --dump: output JSON instead of a text table";
@@ -32,6 +33,7 @@ struct CliOptions {
     keep_overlaps: bool,
     rebuild: bool,
     offset_search: bool,
+    decode_score: bool,
     offset_max: usize,
     dump: bool,
     json: bool,
@@ -45,6 +47,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     let mut keep_overlaps = false;
     let mut rebuild = false;
     let mut offset_search = false;
+    let mut decode_score = false;
     let mut offset_max: usize = OffsetSearchOptions::default().max_offset;
     let mut dump = false;
     let mut json = false;
@@ -56,6 +59,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
             "--keep-overlaps" => keep_overlaps = true,
             "--rebuild" => rebuild = true,
             "--offset-search" => offset_search = true,
+            "--decode-score" => decode_score = true,
             "--offset-max" => {
                 let val = args_iter.next().ok_or_else(|| {
                     format!("--offset-max requires a value\n{USAGE}")
@@ -100,6 +104,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
         keep_overlaps,
         rebuild,
         offset_search,
+        decode_score,
         offset_max,
         dump,
         json,
@@ -273,7 +278,11 @@ fn main() {
 
     if cli.offset_search {
         let profile = CameraJpegProfile::canon_ixus_310hs();
-        let opts = OffsetSearchOptions { max_offset: cli.offset_max, step: 1 };
+        let opts = OffsetSearchOptions {
+            max_offset: cli.offset_max,
+            step: 1,
+            decode_score: cli.decode_score,
+        };
         match rebuild_with_offset_search(&bytes, &candidates, &profile, &out_dir, &opts) {
             Ok(per_candidate) => {
                 let total: usize = per_candidate.iter().map(|v| v.len()).sum();
@@ -284,29 +293,44 @@ fn main() {
                     }
                     // Find the best-scoring result for the summary line.
                     let best = results.iter().max_by(|a, b| {
-                        a.score.total.partial_cmp(&b.score.total).unwrap()
+                        a.final_score.partial_cmp(&b.final_score).unwrap()
                     }).unwrap();
                     println!(
-                        "  [{}] {} offset variant(s) — best offset={} score={:.3} ({})",
+                        "  [{}] {} offset variant(s) — best offset={} score={:.3} [{}] ({})",
                         i,
                         results.len(),
                         best.offset,
-                        best.score.total,
+                        best.final_score,
+                        if best.used_decode_score { "decode" } else { "entropy" },
                         best.path.file_name().unwrap_or_default().to_string_lossy(),
                     );
                     // Print top-5 by score (descending).
                     let mut ranked: Vec<_> = results.iter().collect();
-                    ranked.sort_by(|a, b| b.score.total.partial_cmp(&a.score.total).unwrap());
+                    ranked.sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap());
                     for r in ranked.iter().take(5) {
-                        println!(
-                            "    offset={:4}  score={:.3}  entropy={:.3}  unique={:.3}  unexpected={}  {}",
-                            r.offset,
-                            r.score.total,
-                            r.score.byte_entropy,
-                            r.score.unique_byte_ratio,
-                            r.score.unexpected_markers,
-                            r.path.file_name().unwrap_or_default().to_string_lossy(),
-                        );
+                        if let Some(decode_score) = &r.decode_score {
+                            println!(
+                                "    offset={:4}  score={:.3}  decode={:.3}  entropy={:.3}  colour={:.3}  pixel={:.3}  block={:.3}  {}",
+                                r.offset,
+                                r.final_score,
+                                decode_score.total,
+                                r.score.total,
+                                decode_score.colour_balance,
+                                decode_score.pixel_entropy,
+                                decode_score.block_artifact_score,
+                                r.path.file_name().unwrap_or_default().to_string_lossy(),
+                            );
+                        } else {
+                            println!(
+                                "    offset={:4}  score={:.3}  entropy={:.3}  unique={:.3}  unexpected={}  {}",
+                                r.offset,
+                                r.final_score,
+                                r.score.total,
+                                r.score.unique_byte_ratio,
+                                r.score.unexpected_markers,
+                                r.path.file_name().unwrap_or_default().to_string_lossy(),
+                            );
+                        }
                     }
                 }
                 println!("Offset search: {} file(s) written", total);
@@ -342,6 +366,7 @@ mod tests {
         assert!(!parsed.keep_overlaps);
         assert!(!parsed.dump);
         assert!(!parsed.json);
+        assert!(!parsed.decode_score);
     }
 
     #[test]
@@ -349,6 +374,7 @@ mod tests {
         let parsed = parse_args(&args(&["carve", "a.jpg", "b.jpg", "c.jpg"])).unwrap();
         assert_eq!(parsed.file_paths, vec!["a.jpg", "b.jpg", "c.jpg"]);
         assert!(!parsed.keep_overlaps);
+        assert!(!parsed.decode_score);
     }
 
     #[test]
@@ -356,6 +382,13 @@ mod tests {
         let parsed = parse_args(&args(&["carve", "--keep-overlaps", "a.jpg", "b.jpg"])).unwrap();
         assert_eq!(parsed.file_paths, vec!["a.jpg", "b.jpg"]);
         assert!(parsed.keep_overlaps);
+    }
+
+    #[test]
+    fn parses_decode_score_flag() {
+        let parsed = parse_args(&args(&["carve", "--offset-search", "--decode-score", "image.jpg"])).unwrap();
+        assert!(parsed.offset_search);
+        assert!(parsed.decode_score);
     }
 
     #[test]
@@ -452,4 +485,3 @@ mod tests {
         assert_eq!(output_dir_for("no_ext"), PathBuf::from("recovered").join("no_ext"));
     }
 }
-

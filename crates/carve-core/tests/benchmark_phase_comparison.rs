@@ -63,7 +63,7 @@ fn benchmark_phase_comparison() {
     let out_dir  = std::env::temp_dir().join("carve_benchmark_phase");
     std::fs::create_dir_all(&out_dir).unwrap();
 
-    let offset_opts = OffsetSearchOptions { max_offset: 64, step: 1 };
+    let offset_opts = OffsetSearchOptions { max_offset: 64, step: 1, decode_score: false };
 
     let mut rows: Vec<CandidateRow> = Vec::new();
     let mut fixtures_processed = 0usize;
@@ -120,8 +120,8 @@ fn benchmark_phase_comparison() {
             // Phase 2 + offset search: best score across offsets 0..=64.
             let (best_offset, best_score) = if let Some(results) = offset_results.get(i) {
                 results.iter()
-                    .max_by(|a, b| a.score.total.partial_cmp(&b.score.total).unwrap())
-                    .map(|r| (r.offset, r.score.total))
+                    .max_by(|a, b| a.final_score.partial_cmp(&b.final_score).unwrap())
+                    .map(|r| (r.offset, r.final_score))
                     .unwrap_or((0, p2_score_val))
             } else {
                 (0, p2_score_val)

@@ -1,5 +1,5 @@
 use crate::jpeg::parse::parse_until_sos;
-use crate::reconstruct::decode::DecodeResult;
+use crate::reconstruct::decode::{decode_jpeg, DecodeResult};
 use crate::reconstruct::image_metrics::{compute_image_metrics, ImageMetrics};
 
 /// Quality score for a reconstructed JPEG candidate.
@@ -45,6 +45,15 @@ pub struct DecodeAwareScore {
     pub total: f32,
 }
 
+/// Final ranking score for a rebuilt candidate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RankedScore {
+    pub entropy_score: JpegScore,
+    pub decode_score: Option<DecodeAwareScore>,
+    pub total: f32,
+    pub used_decode_score: bool,
+}
+
 /// Combine decode-based image metrics into a single weighted score.
 ///
 /// Formula:
@@ -75,6 +84,42 @@ pub fn score_image_metrics(metrics: &ImageMetrics) -> DecodeAwareScore {
         pixel_entropy: metrics.pixel_entropy,
         block_artifact_score: metrics.block_artifact_score,
         total,
+    }
+}
+
+/// Score a rebuilt JPEG for ranking in the reconstruction pipeline.
+///
+/// The entropy score is always computed. When `use_decode_score` is enabled,
+/// the rebuilt JPEG is decoded and the decode-aware score is used when decode
+/// succeeds. If decode fails, the final score falls back to the entropy score.
+pub fn score_rebuilt_candidate(jpeg_bytes: &[u8], entropy: &[u8], use_decode_score: bool) -> RankedScore {
+    let entropy_score = score_entropy_stream(entropy);
+
+    if !use_decode_score {
+        return RankedScore {
+            total: entropy_score.total,
+            entropy_score,
+            decode_score: None,
+            used_decode_score: false,
+        };
+    }
+
+    let decoded = decode_jpeg(jpeg_bytes);
+    if !decoded.success {
+        return RankedScore {
+            total: entropy_score.total,
+            entropy_score,
+            decode_score: None,
+            used_decode_score: false,
+        };
+    }
+
+    let decode_score = score_decoded_image(&decoded);
+    RankedScore {
+        total: decode_score.total,
+        entropy_score,
+        decode_score: Some(decode_score),
+        used_decode_score: true,
     }
 }
 
@@ -376,5 +421,36 @@ mod tests {
         let decoded = decode_jpeg(&bytes);
 
         assert!(score_image(decoded) > score_image(DecodeResult::default()));
+    }
+
+    #[test]
+    fn rebuilt_candidate_uses_entropy_score_when_decode_scoring_disabled() {
+        let entropy = all_bytes_data();
+        let ranked = score_rebuilt_candidate(&[0u8; 64], &entropy, false);
+
+        assert_eq!(ranked.total, ranked.entropy_score.total);
+        assert!(ranked.decode_score.is_none());
+        assert!(!ranked.used_decode_score);
+    }
+
+    #[test]
+    fn rebuilt_candidate_falls_back_to_entropy_when_decode_fails() {
+        let entropy = all_bytes_data();
+        let ranked = score_rebuilt_candidate(&[0u8; 64], &entropy, true);
+
+        assert_eq!(ranked.total, ranked.entropy_score.total);
+        assert!(ranked.decode_score.is_none());
+        assert!(!ranked.used_decode_score);
+    }
+
+    #[test]
+    fn rebuilt_candidate_uses_decode_score_when_decode_succeeds() {
+        let bytes = std::fs::read(example_jpeg_path()).unwrap();
+        let entropy = vec![0xAA; 4096];
+        let ranked = score_rebuilt_candidate(&bytes, &entropy, true);
+
+        assert!(ranked.decode_score.is_some());
+        assert!(ranked.used_decode_score);
+        assert_eq!(ranked.total, ranked.decode_score.as_ref().unwrap().total);
     }
 }
