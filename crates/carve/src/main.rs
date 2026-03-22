@@ -10,7 +10,7 @@ use carve_core::jpeg::restart_scan::scan_restart_markers;
 use carve_core::jpeg::validate::{PatchEoiPolicy, ValidationOptions};
 use carve_core::reconstruct::camera_profile::CameraJpegProfile;
 use carve_core::reconstruct::rebuilder::{rebuild_candidates, rebuild_with_offset_search, OffsetSearchOptions};
-use carve_core::report::write_report;
+use carve_core::report::{write_report_with_scoring, CandidateScoringInfo};
 use carve_core::scanner::{apply_validated_overlap_policy, recover_candidates, OverlapOptions};
 
 const USAGE: &str = "\
@@ -276,6 +276,8 @@ fn main() {
         }
     }
 
+    let mut report_scoring = vec![None; candidates.len()];
+
     if cli.offset_search {
         let profile = CameraJpegProfile::canon_ixus_310hs();
         let opts = OffsetSearchOptions {
@@ -304,6 +306,7 @@ fn main() {
                         if best.used_decode_score { "decode" } else { "entropy" },
                         best.path.file_name().unwrap_or_default().to_string_lossy(),
                     );
+                    report_scoring[i] = Some(CandidateScoringInfo::from_offset_search_result(best));
                     // Print top-5 by score (descending).
                     let mut ranked: Vec<_> = results.iter().collect();
                     ranked.sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap());
@@ -343,7 +346,7 @@ fn main() {
     }
 
     let report_path = out_dir.join("report.jsonl");
-    if let Err(e) = write_report(&report_path, &candidates) {
+    if let Err(e) = write_report_with_scoring(&report_path, &candidates, &report_scoring) {
         eprintln!("Failed to write report: {}", e);
         process::exit(1);
     }
