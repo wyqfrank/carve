@@ -11,20 +11,18 @@ The project has two distinct recovery phases:
 
 ## Example Results
 
-The checked-in examples below are recovered outputs produced by the pipeline:
+Real recoveries from the pipeline:
 
-```text
-Raw carve
-    ->
-Camera-aware reconstruction
-    ->
-Recovered image
-```
-
-| Result | Notes |
-|--------|-------|
-| ![Recovered IMG_1373](docs/examples/IMG_1373.jpg) | `IMG_1373` recovered from fragmented/truncated storage data |
-| ![Recovered IMG_1403](docs/examples/IMG_1403.jpg) | `IMG_1403` recovered from corrupted storage data |
+<table>
+  <tr>
+    <td align="center"><img src="docs/examples/IMG_1373.jpg" alt="Recovered IMG_1373" /></td>
+    <td align="center"><img src="docs/examples/IMG_1403.jpg" alt="Recovered IMG_1403" /></td>
+  </tr>
+  <tr>
+    <td align="center"><code>IMG_1373</code> — recovered from fragmented/truncated storage data</td>
+    <td align="center"><code>IMG_1403</code> — recovered from corrupted storage data</td>
+  </tr>
+</table>
 
 When you run the CLI with `--rebuild` or `--offset-search`, Carve writes both the raw carved candidate and the rebuilt variants so they can be compared side by side.
 
