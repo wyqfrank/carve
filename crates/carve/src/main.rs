@@ -8,23 +8,33 @@ use carve_core::jpeg::marker_dump::dump_jpeg_segments;
 use carve_core::jpeg::parse::parse_until_sos;
 use carve_core::jpeg::restart_scan::scan_restart_markers;
 use carve_core::jpeg::validate::{PatchEoiPolicy, ValidationOptions};
-use carve_core::report::write_report;
+use carve_core::reconstruct::camera_profile::CameraJpegProfile;
+use carve_core::reconstruct::rebuilder::{rebuild_candidates, rebuild_with_offset_search, OffsetSearchOptions};
+use carve_core::report::{write_report_with_scoring, CandidateScoringInfo};
 use carve_core::scanner::{apply_validated_overlap_policy, recover_candidates, OverlapOptions};
 
 const USAGE: &str = "\
 Usage:
-  carve [--keep-overlaps] <file|pattern> [<file|pattern> ...]
+  carve [--keep-overlaps] [--rebuild] [--offset-search] [--decode-score] [--offset-max N] <file|pattern> ...
   carve --dump [--json] <file>
 
 Flags:
-  --keep-overlaps   Emit all candidates without overlap suppression
-  --dump            Print JPEG segment structure instead of carving
-  --json            With --dump: output JSON instead of a text table";
+  --keep-overlaps      Emit all candidates without overlap suppression
+  --rebuild            Also write camera-profile rebuilt JPEGs (rebuilt_NNN.jpg)
+  --offset-search      For each candidate try multiple entropy offsets (rebuilt_NNN_offset_MMMM.jpg)
+  --decode-score       Use decode-aware scoring for offset ranking with entropy fallback
+  --offset-max N       Maximum byte offset to try with --offset-search (default: 512)
+  --dump               Print JPEG segment structure instead of carving
+  --json               With --dump: output JSON instead of a text table";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliOptions {
     file_paths: Vec<String>,
     keep_overlaps: bool,
+    rebuild: bool,
+    offset_search: bool,
+    decode_score: bool,
+    offset_max: usize,
     dump: bool,
     json: bool,
 }
@@ -35,16 +45,33 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     }
 
     let mut keep_overlaps = false;
+    let mut rebuild = false;
+    let mut offset_search = false;
+    let mut decode_score = false;
+    let mut offset_max: usize = OffsetSearchOptions::default().max_offset;
     let mut dump = false;
     let mut json = false;
     let mut file_paths: Vec<String> = Vec::new();
+    let mut args_iter = args[1..].iter().peekable();
 
-    for arg in &args[1..] {
+    while let Some(arg) = args_iter.next() {
         match arg.as_str() {
             "--keep-overlaps" => keep_overlaps = true,
+            "--rebuild" => rebuild = true,
+            "--offset-search" => offset_search = true,
+            "--decode-score" => decode_score = true,
+            "--offset-max" => {
+                let val = args_iter.next().ok_or_else(|| {
+                    format!("--offset-max requires a value\n{USAGE}")
+                })?;
+                offset_max = val.parse::<usize>().map_err(|_| {
+                    format!("--offset-max value must be a non-negative integer, got '{val}'\n{USAGE}")
+                })?;
+                offset_search = true; // --offset-max implies --offset-search
+            }
             "--dump" => dump = true,
             "--json" => json = true,
-            _ if arg.starts_with('-') => {
+            arg if arg.starts_with('-') => {
                 return Err(format!("Unknown flag: {arg}\n{USAGE}"));
             }
             _ => {
@@ -75,6 +102,10 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     Ok(CliOptions {
         file_paths,
         keep_overlaps,
+        rebuild,
+        offset_search,
+        decode_score,
+        offset_max,
         dump,
         json,
     })
@@ -223,8 +254,99 @@ fn main() {
         }
     }
 
+    if cli.rebuild {
+        let profile = CameraJpegProfile::canon_ixus_310hs();
+        match rebuild_candidates(&bytes, &candidates, &profile, &out_dir) {
+            Ok(rebuilt_paths) => {
+                let mut rebuilt_count = 0;
+                for (i, maybe_path) in rebuilt_paths.iter().enumerate() {
+                    if let Some(path) = maybe_path {
+                        println!("  [{}] rebuilt → {}", i, path.display());
+                        rebuilt_count += 1;
+                    } else {
+                        println!("  [{}] rebuild skipped (dimensions unknown)", i);
+                    }
+                }
+                println!("Rebuilt {} of {} candidate(s)", rebuilt_count, candidates.len());
+            }
+            Err(e) => {
+                eprintln!("Rebuild failed: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    let mut report_scoring = vec![None; candidates.len()];
+
+    if cli.offset_search {
+        let profile = CameraJpegProfile::canon_ixus_310hs();
+        let opts = OffsetSearchOptions {
+            max_offset: cli.offset_max,
+            step: 1,
+            decode_score: cli.decode_score,
+        };
+        match rebuild_with_offset_search(&bytes, &candidates, &profile, &out_dir, &opts) {
+            Ok(per_candidate) => {
+                let total: usize = per_candidate.iter().map(|v| v.len()).sum();
+                for (i, results) in per_candidate.iter().enumerate() {
+                    if results.is_empty() {
+                        println!("  [{}] offset search skipped (dimensions unknown)", i);
+                        continue;
+                    }
+                    // Find the best-scoring result for the summary line.
+                    let best = results.iter().max_by(|a, b| {
+                        a.final_score.partial_cmp(&b.final_score).unwrap()
+                    }).unwrap();
+                    println!(
+                        "  [{}] {} offset variant(s) — best offset={} score={:.3} [{}] ({})",
+                        i,
+                        results.len(),
+                        best.offset,
+                        best.final_score,
+                        if best.used_decode_score { "decode" } else { "entropy" },
+                        best.path.file_name().unwrap_or_default().to_string_lossy(),
+                    );
+                    report_scoring[i] = Some(CandidateScoringInfo::from_offset_search_result(best));
+                    // Print top-5 by score (descending).
+                    let mut ranked: Vec<_> = results.iter().collect();
+                    ranked.sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap());
+                    for r in ranked.iter().take(5) {
+                        if let Some(decode_score) = &r.decode_score {
+                            println!(
+                                "    offset={:4}  score={:.3}  decode={:.3}  entropy={:.3}  colour={:.3}  pixel={:.3}  block={:.3}  {}",
+                                r.offset,
+                                r.final_score,
+                                decode_score.total,
+                                r.score.total,
+                                decode_score.colour_balance,
+                                decode_score.pixel_entropy,
+                                decode_score.block_artifact_score,
+                                r.path.file_name().unwrap_or_default().to_string_lossy(),
+                            );
+                        } else {
+                            println!(
+                                "    offset={:4}  score={:.3}  entropy={:.3}  unique={:.3}  unexpected={}  {}",
+                                r.offset,
+                                r.final_score,
+                                r.score.total,
+                                r.score.unique_byte_ratio,
+                                r.score.unexpected_markers,
+                                r.path.file_name().unwrap_or_default().to_string_lossy(),
+                            );
+                        }
+                    }
+                }
+                println!("Offset search: {} file(s) written", total);
+            }
+            Err(e) => {
+                eprintln!("Offset search failed: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
     let report_path = out_dir.join("report.jsonl");
-    if let Err(e) = write_report(&report_path, &candidates) {
+    if let Err(e) = write_report_with_scoring(&report_path, &candidates, &report_scoring) {
         eprintln!("Failed to write report: {}", e);
         process::exit(1);
     }
@@ -247,6 +369,7 @@ mod tests {
         assert!(!parsed.keep_overlaps);
         assert!(!parsed.dump);
         assert!(!parsed.json);
+        assert!(!parsed.decode_score);
     }
 
     #[test]
@@ -254,6 +377,7 @@ mod tests {
         let parsed = parse_args(&args(&["carve", "a.jpg", "b.jpg", "c.jpg"])).unwrap();
         assert_eq!(parsed.file_paths, vec!["a.jpg", "b.jpg", "c.jpg"]);
         assert!(!parsed.keep_overlaps);
+        assert!(!parsed.decode_score);
     }
 
     #[test]
@@ -261,6 +385,13 @@ mod tests {
         let parsed = parse_args(&args(&["carve", "--keep-overlaps", "a.jpg", "b.jpg"])).unwrap();
         assert_eq!(parsed.file_paths, vec!["a.jpg", "b.jpg"]);
         assert!(parsed.keep_overlaps);
+    }
+
+    #[test]
+    fn parses_decode_score_flag() {
+        let parsed = parse_args(&args(&["carve", "--offset-search", "--decode-score", "image.jpg"])).unwrap();
+        assert!(parsed.offset_search);
+        assert!(parsed.decode_score);
     }
 
     #[test]
@@ -276,6 +407,60 @@ mod tests {
         let parsed = parse_args(&args(&["carve", "--dump", "--json", "image.jpg"])).unwrap();
         assert!(parsed.dump);
         assert!(parsed.json);
+    }
+
+    #[test]
+    fn parses_rebuild_flag() {
+        let parsed = parse_args(&args(&["carve", "--rebuild", "image.jpg"])).unwrap();
+        assert!(parsed.rebuild);
+        assert!(!parsed.keep_overlaps);
+        assert_eq!(parsed.file_paths, vec!["image.jpg"]);
+    }
+
+    #[test]
+    fn rebuild_false_by_default() {
+        let parsed = parse_args(&args(&["carve", "image.jpg"])).unwrap();
+        assert!(!parsed.rebuild);
+    }
+
+    #[test]
+    fn parses_offset_search_flag() {
+        let parsed = parse_args(&args(&["carve", "--offset-search", "image.jpg"])).unwrap();
+        assert!(parsed.offset_search);
+        assert_eq!(parsed.offset_max, 512);
+    }
+
+    #[test]
+    fn parses_offset_max_flag() {
+        let parsed = parse_args(&args(&["carve", "--offset-max", "256", "image.jpg"])).unwrap();
+        assert!(parsed.offset_search);
+        assert_eq!(parsed.offset_max, 256);
+    }
+
+    #[test]
+    fn offset_max_implies_offset_search() {
+        let parsed = parse_args(&args(&["carve", "--offset-max", "100", "image.jpg"])).unwrap();
+        assert!(parsed.offset_search);
+    }
+
+    #[test]
+    fn offset_search_false_by_default() {
+        let parsed = parse_args(&args(&["carve", "image.jpg"])).unwrap();
+        assert!(!parsed.offset_search);
+        assert_eq!(parsed.offset_max, 512);
+    }
+
+    #[test]
+    fn rejects_offset_max_without_value() {
+        let err = parse_args(&args(&["carve", "--offset-max", "image.jpg"])).unwrap_err();
+        // "image.jpg" is not a valid usize, so should get a parse error
+        assert!(err.contains("integer") || err.contains("offset-max"));
+    }
+
+    #[test]
+    fn rejects_offset_max_non_integer() {
+        let err = parse_args(&args(&["carve", "--offset-max", "abc", "image.jpg"])).unwrap_err();
+        assert!(err.contains("integer"));
     }
 
     #[test]
@@ -303,4 +488,3 @@ mod tests {
         assert_eq!(output_dir_for("no_ext"), PathBuf::from("recovered").join("no_ext"));
     }
 }
-
