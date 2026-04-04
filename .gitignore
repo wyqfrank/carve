@@ -15,12 +15,13 @@
 .DS_Store
 Thumbs.db
 
-# Tooling
+# Tooling & Personal Docs
 .claude/
 CLAUDE.md
 SPEC.md
 docs/canon_ixus_310hs_profile_analysis.md
 docs/benchmark-phase2.md
+tickets/
 
 # fixtures (private photos)
 crates/carve-core/tests/fixtures/*
