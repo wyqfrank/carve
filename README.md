@@ -1,6 +1,6 @@
 # Carve
 
-Carve is a Rust digital forensics tool for recovering damaged JPEGs from raw byte streams such as SD card dumps, sector captures, or partially recovered binary blobs.
+Carve is a two-stage digital photo recovery system that combines deterministic binary-level JPEG carving with camera-aware reconstruction, explicitly separating raw data recovery from structural repair.
 
 Traditional file carvers look for `FF D8` and copy bytes until `FF D9`. That works for simple cases, but it breaks down when the JPEG header is damaged, the entropy stream is truncated, or the carve begins at the wrong alignment. Carve goes further: it parses JPEG structure, scans entropy-coded data safely, and then attempts camera-aware reconstruction for Canon IXUS 310 HS images.
 
@@ -44,6 +44,28 @@ The header is parseable. The entropy stream is not; it is compressed bitstream d
 - the wrong quantisation or Huffman tables can decode into severe color/block artifacts even if the entropy bytes are intact
 
 That means a serious JPEG carver has to do more than copy bytes between two markers.
+
+## Core Algorithms & Techniques
+
+### Entropy-aware JPEG scanning
+
+Instead of naively copying bytes from `FF D8` to `FF D9`, Carve walks the JPEG entropy stream while respecting byte stuffing (`FF 00`) and valid in-stream marker behaviour. This reduces false end-of-image detection and makes truncated or partially corrupted candidates recoverable enough to analyse further.
+
+### Candidate scoring and ranking
+
+Recovered candidates are ranked rather than blindly emitted. The current pipeline uses entropy-based heuristics such as Shannon entropy, byte diversity, and invalid marker penalties to prioritise plausible JPEG streams and suppress weaker overlapping candidates.
+
+### Camera-specific header reconstruction
+
+For Canon IXUS 310 HS images, Carve rebuilds a minimal valid JPEG header from a camera profile derived from clean reference files. Reusing invariant DQT/DHT tables and the known SOF/SOS structure makes it possible to decode candidates even when the original on-disk header is missing, damaged, or partially overwritten.
+
+### Entropy offset search
+
+Some corrupted candidates begin decoding mid-MCU, which produces horizontal shifts, repeated blocks, or seam-like artifacts. Carve mitigates this by trying bounded offsets into the carved entropy stream and ranking the rebuilt outputs, allowing the pipeline to recover better-aligned decodes without changing the underlying recovery assumptions.
+
+### Decode-aware validation (next step)
+
+Entropy statistics are useful, but they cannot measure whether a reconstructed image actually looks correct. The next scoring layer evaluates decoded pixel output directly so the system can prefer visually coherent recoveries over candidates that merely resemble valid compressed data.
 
 ## Recovery Pipeline
 
@@ -221,10 +243,9 @@ recovered/
 
 ## Future Work
 
-- restart-marker resynchronisation for damaged streams
-- multi-camera profile support
-- better entropy alignment heuristics
+- decode-based validation and scoring
 - stronger fragment reassembly across non-contiguous clusters
+- better entropy alignment heuristics
+- multi-camera profile support
 - progressive JPEG recovery
-- decoder-backed or perceptual scoring instead of entropy-only ranking
-- AI-assisted artifact repair after structural recovery
+- decoder-backed or perceptual scoring beyond entropy-only ranking
