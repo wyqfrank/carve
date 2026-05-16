@@ -63,9 +63,9 @@ For Canon IXUS 310 HS images, Carve rebuilds a minimal valid JPEG header from a 
 
 Some corrupted candidates begin decoding mid-MCU, which produces horizontal shifts, repeated blocks, or seam-like artifacts. Carve mitigates this by trying bounded offsets into the carved entropy stream and ranking the rebuilt outputs, allowing the pipeline to recover better-aligned decodes without changing the underlying recovery assumptions.
 
-### Decode-aware validation (next step)
+### Decode-aware validation
 
-Entropy statistics are useful, but they cannot measure whether a reconstructed image actually looks correct. The next scoring layer evaluates decoded pixel output directly so the system can prefer visually coherent recoveries over candidates that merely resemble valid compressed data.
+Entropy statistics are useful, but they cannot measure whether a reconstructed image actually looks correct. Carve includes an opt-in scoring layer (`--decode-score`) that evaluates decoded pixel output directly (checking color coherence, pixel entropy, and artifacts) so the system can prefer visually coherent recoveries over candidates that merely resemble valid compressed data. Because pixel-by-pixel decoding is computationally expensive, this is disabled by default.
 
 ## Recovery Pipeline
 
@@ -207,6 +207,12 @@ carve --rebuild image.bin
 carve --offset-search --offset-max 512 image.bin
 ```
 
+Enable decode-aware scoring for higher confidence rankings:
+
+```bash
+carve --rebuild --decode-score image.bin
+```
+
 Inspect JPEG structure instead of carving:
 
 ```bash
@@ -239,9 +245,7 @@ recovered/
 
 ## Future Work
 
-- decode-based validation and scoring
 - stronger fragment reassembly across non-contiguous clusters
 - better entropy alignment heuristics
 - multi-camera profile support
 - progressive JPEG recovery
-- decoder-backed or perceptual scoring beyond entropy-only ranking
