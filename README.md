@@ -2,6 +2,8 @@
 
 Carve is a two-stage digital photo recovery system that combines deterministic binary-level JPEG carving with camera-aware reconstruction, explicitly separating raw data recovery from structural repair.
 
+I went on a trip with a new Canon IXUS, came home, and found half my shots corrupted by a failing SD card. I built Carve to recover them — and to learn Rust.
+
 Traditional file carvers look for `FF D8` and copy bytes until `FF D9`. That works for simple cases, but it breaks down when the JPEG header is damaged, the entropy stream is truncated, or the carve begins at the wrong alignment. Carve goes further: it parses JPEG structure, scans entropy-coded data safely, and then attempts camera-aware reconstruction for Canon IXUS 310 HS images.
 
 The project has two distinct recovery phases:
@@ -120,8 +122,6 @@ Phase 2 is camera-aware and currently focused on Canon IXUS 310 HS:
 - reuse camera-specific table/header fields where available
 - try small offsets into the entropy stream to correct MCU alignment issues
 - rank rebuilt variants to help pick the best output
-
-This is the difference between "I found JPEG-looking bytes" and "I rebuilt something close to what the camera firmware intended to write."
 
 ## Camera-Specific Recovery
 
