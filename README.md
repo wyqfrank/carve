@@ -239,7 +239,7 @@ recovered/
 - Partial entropy corruption can still make the recovered image decode badly or fail entirely.
 - Overwritten data cannot be reconstructed if the original compressed bytes are gone.
 - If dimensions cannot be recovered, Phase 2 rebuild output may be skipped.
-- Extreme fragmentation is still a hard case; the current pipeline does not fully reassemble arbitrary multi-fragment JPEGs.
+- Fragmented recovery is currently limited to two-fragment assembly across cluster boundaries; arbitrary multi-fragment JPEGs spanning three or more non-contiguous clusters are not yet supported.
 - Progressive JPEGs are not the focus of the current reconstruction path.
 - Canon IXUS 310 HS is the documented camera-specific profile today; generic carving works more broadly than camera-aware rebuilding.
 
