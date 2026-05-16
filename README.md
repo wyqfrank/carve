@@ -142,8 +142,6 @@ That makes reconstruction practical:
 
 Why this matters: if the entropy stream is mostly intact but the original on-disk header is wrong or partially overwritten, a rebuilt camera-correct header is often the difference between a broken decode and a usable image.
 
-For the detailed analysis behind the profile, see [docs/canon_ixus_310hs_profile_analysis.md](/mnt/c/Users/frank/projects/carve/docs/canon_ixus_310hs_profile_analysis.md).
-
 ## Architecture
 
 ```text
